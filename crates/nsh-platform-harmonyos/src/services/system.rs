@@ -262,44 +262,130 @@ impl System {
         request: nsh_core::file_dialog::FileRequest,
     ) -> napi_ohos::Result<()> {
         use nsh_core::file_dialog::FileRequest as F;
+        let fail = |message: String| {
+            if let Some(route) = route.upgrade() {
+                route.send(Message::HostEvent(
+                    EventKind::FileRequest,
+                    EventPayload::file_failed(id, message),
+                ));
+            }
+            Ok(())
+        };
         match request {
-            F::OpenPath(path) => self.submit(
-                host,
-                Request {
-                    route,
-                    kind: EventKind::FileRequest,
-                    id,
-                    stream: false,
-                    answer: true,
-                    paste: None,
-                },
-                SystemCommand {
-                    op: "file-open-path".into(),
-                    uri: Some(path.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-            ),
-            F::OpenDialog(_) | F::SaveDialog(_) | F::RevealPath(_) | F::MoveToTrash(_) => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::FileRequest,
-                        EventPayload::file_failed(
-                            id,
-                            "local path file dialogs and file manager actions are not supported on HarmonyOS",
-                        ),
-                    ));
+            F::OpenPath(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
                 }
-                Ok(())
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-open-path".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
             }
-            _ => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::FileRequest,
-                        EventPayload::file_failed(id, "unsupported file request on HarmonyOS"),
-                    ));
+            F::OpenDialog(dialog) => {
+                let mode = match dialog.kind {
+                    nsh_core::file_dialog::OpenDialogKind::Folders => "folders",
+                    nsh_core::file_dialog::OpenDialogKind::FilesAndFolders => "both",
+                    _ => "files",
+                };
+                let filters = format_ohos_open_filters(&dialog.filters);
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-open-dialog".into(),
+                        name: Some(mode.into()),
+                        count: Some(if dialog.multiple { 500 } else { 1 }),
+                        paths: (!filters.is_empty()).then_some(filters),
+                        uri: dialog.directory.map(|p| p.to_string_lossy().into_owned()),
+                        title: dialog.title,
+                        ..Default::default()
+                    },
+                )
+            }
+            F::SaveDialog(dialog) => {
+                let choices = format_ohos_save_choices(&dialog.filters);
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-save-dialog".into(),
+                        name: dialog.file_name,
+                        paths: (!choices.is_empty()).then_some(choices),
+                        uri: dialog.directory.map(|p| p.to_string_lossy().into_owned()),
+                        title: dialog.title,
+                        ..Default::default()
+                    },
+                )
+            }
+            F::RevealPath(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
                 }
-                Ok(())
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-reveal-path".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
             }
+            F::MoveToTrash(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
+                }
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-move-to-trash".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
+            }
+            _ => fail("unsupported file request on HarmonyOS".into()),
         }
     }
 
@@ -662,7 +748,10 @@ impl System {
         } else if request.kind == EventKind::FileRequest {
             match value.error {
                 Some(error) => EventPayload::file_failed(request.id, error),
-                None => EventPayload::file_answer(request.id, Vec::new()),
+                None => EventPayload::file_answer(
+                    request.id,
+                    parse_file_request_paths(value.files.as_deref()),
+                ),
             }
         } else if request.kind == EventKind::Audio {
             use nsh_core::audio::{AudioError, AudioEvent as E};
@@ -1006,6 +1095,90 @@ pub(crate) fn read_picked(
     request.finish(raw)
 }
 
+/// Formats `FileFilter` entries for HarmonyOS `DocumentSelectOptions.fileSuffixFilters`
+/// (`"Description|.ext1,.ext2"`).
+#[allow(dead_code)]
+fn format_ohos_open_filters(filters: &[nsh_core::file_dialog::FileFilter]) -> Vec<String> {
+    let mut out = Vec::new();
+    for filter in filters {
+        let suffixes: Vec<String> = filter
+            .extensions
+            .iter()
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!(".{ext}"))
+            .collect();
+        if suffixes.is_empty() {
+            continue;
+        }
+        let joined = suffixes.join(",");
+        let name = filter.name.replace('|', " ");
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            out.push(joined);
+        } else {
+            out.push(format!("{trimmed}|{joined}"));
+        }
+    }
+    out
+}
+
+/// Formats `FileFilter` entries for HarmonyOS `DocumentSaveOptions.fileSuffixChoices`
+/// (one `"Description|.ext"` option per suffix).
+#[allow(dead_code)]
+fn format_ohos_save_choices(filters: &[nsh_core::file_dialog::FileFilter]) -> Vec<String> {
+    let mut out = Vec::new();
+    for filter in filters {
+        let name = filter.name.replace('|', " ");
+        let trimmed = name.trim();
+        for ext in &filter.extensions {
+            if ext.is_empty() {
+                continue;
+            }
+            if trimmed.is_empty() {
+                out.push(format!(".{ext}"));
+            } else {
+                out.push(format!("{trimmed}|.{ext}"));
+            }
+        }
+    }
+    out
+}
+
+/// Validates that a file path passed to `open_path`, `reveal_path`, or `move_to_trash`
+/// is absolute (or already a `file://` URI) and exists on disk when given as a filesystem path.
+#[allow(dead_code)]
+fn validate_existing_file_request_path(path: &std::path::Path) -> Result<(), String> {
+    let raw = path.to_string_lossy();
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if raw.contains("://") {
+        return Ok(());
+    }
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    if !path.exists() {
+        return Err(format!("path does not exist: {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Parses the JSON array of chosen paths returned by `NativeSystem.ets` file dialogs.
+#[allow(dead_code)]
+fn parse_file_request_paths(files: Option<&str>) -> Vec<std::path::PathBuf> {
+    let Some(raw) = files.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_str::<Vec<String>>(raw) else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1313,48 @@ mod tests {
             .unwrap();
         }
         assert_eq!(requests.keys().copied().collect::<Vec<_>>(), vec![1, 2, 4]);
+    }
+    #[test]
+    fn file_dialog_filters_and_paths_format_for_ohos_picker() {
+        use nsh_core::file_dialog::FileFilter;
+        let filters = [
+            FileFilter::new("Markdown", ["md", "markdown"]),
+            FileFilter::new("", ["txt"]),
+        ];
+        assert_eq!(
+            format_ohos_open_filters(&filters),
+            vec!["Markdown|.md,.markdown", ".txt"]
+        );
+        assert_eq!(
+            format_ohos_save_choices(&filters),
+            vec!["Markdown|.md", "Markdown|.markdown", ".txt"]
+        );
+        assert_eq!(
+            parse_file_request_paths(Some(r#"["/storage/docs/a.md","/storage/docs/b.txt"]"#)),
+            vec![
+                std::path::PathBuf::from("/storage/docs/a.md"),
+                std::path::PathBuf::from("/storage/docs/b.txt"),
+            ]
+        );
+        assert!(parse_file_request_paths(Some("[]")).is_empty());
+        assert!(parse_file_request_paths(None).is_empty());
+    }
+    #[test]
+    fn file_request_path_validation_rejects_relative_and_missing_paths() {
+        let temp_dir = std::env::temp_dir();
+        assert!(validate_existing_file_request_path(&temp_dir).is_ok());
+        assert!(
+            validate_existing_file_request_path(std::path::Path::new(
+                "file://docs/storage/Users/currentUser/Documents/a.txt"
+            ))
+            .is_ok()
+        );
+        assert!(validate_existing_file_request_path(std::path::Path::new("note.md")).is_err());
+        assert!(
+            validate_existing_file_request_path(std::path::Path::new(
+                "/nonexistent-nsh-path-12345/note.md"
+            ))
+            .is_err()
+        );
     }
 }

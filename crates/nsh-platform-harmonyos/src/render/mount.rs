@@ -133,6 +133,7 @@ pub(crate) struct UiContext {
     pub(crate) fonts: Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
+    pub(crate) main_window: std::cell::RefCell<crate::services::desktop::MainWindowState>,
     pub(crate) appearance: std::cell::Cell<nsh_core::platform::Appearance>,
 }
 
@@ -170,6 +171,7 @@ pub(crate) struct Mounter {
     deferred: Vec<MountItem>,
     uncreated_scroll_content: rustc_hash::FxHashMap<NodeId, Size>,
     dialogs: crate::services::dialogs::Dialogs,
+    desktop: crate::services::desktop::DesktopState,
 }
 
 impl std::ops::Deref for Mounter {
@@ -180,6 +182,9 @@ impl std::ops::Deref for Mounter {
 }
 
 impl Mounter {
+    pub(crate) fn batch_count(&self) -> u64 {
+        self.batches
+    }
     pub(crate) fn scene_ready(&self) -> Result<()> {
         if let Some(scene) = self.scene.borrow().as_ref() {
             scene.ready()?;
@@ -295,9 +300,41 @@ impl Mounter {
         }
         result.and(self.system_appearance())
     }
+    fn apply_main_backdrop(&self) {
+        if let Ok(root) = self.node(nsh_core::ROOT_ID) {
+            use nsh_core::{desktop::Backdrop, platform::Appearance};
+            use ohos_arkui_binding::{
+                common::attribute::ArkUINodeAttributeNumber,
+                types::{advanced::BlurStyle, attribute::ArkUINodeAttributeType as A},
+            };
+            let backdrop = self.main_window.borrow().backdrop;
+            let style = match backdrop {
+                Backdrop::None => None,
+                Backdrop::Window => Some(BlurStyle::BackgroundThick),
+                Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
+                Backdrop::Popover => Some(BlurStyle::BackgroundThin),
+                Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
+            };
+            if let Some(style) = style {
+                // `ArkUI_ColorMode`: 0 = SYSTEM, 1 = LIGHT, 2 = DARK.
+                let color_mode = match self.appearance.get() {
+                    Appearance::System => 0,
+                    Appearance::Light => 1,
+                    Appearance::Dark => 2,
+                };
+                let _ = root.native.borrow().set_background_blur_style([
+                    ArkUINodeAttributeNumber::Int(u32::from(style) as i32),
+                    ArkUINodeAttributeNumber::Int(color_mode),
+                ]);
+            } else {
+                let _ = root.native.borrow().reset_attribute(A::BackgroundBlurStyle);
+            }
+        }
+    }
     fn system_appearance(&self) -> Result<()> {
         let appearance = self.appearance.get();
         self.host.set_appearance(appearance)?;
+        self.apply_main_backdrop();
         let dark =
             appearance.resolve(self.platform.get().color_scheme) == nsh_engine::ColorScheme::Dark;
         let config = self.dispatcher.upgrade().and_then(|route| {
@@ -359,11 +396,12 @@ impl Mounter {
     }
     pub(crate) fn cancel_input(&self) -> Result<()> {
         let mut result = Ok(());
+        let desktop = self.platform.get().os.is_desktop();
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {
             result = result.and(self.touches.borrow_mut().cancel(root));
         }
         for node in self.nodes.values() {
-            if let Some(input) = node.input.borrow().as_ref() {
+            if !desktop && let Some(input) = node.input.borrow().as_ref() {
                 result = result.and(input.suspend());
             }
             if let Some(scroll) = node.scroll.borrow().as_ref() {
@@ -418,12 +456,25 @@ impl Mounter {
     }
     fn route_back(&self, app_listener: bool) -> Result<()> {
         use nsh_core::navigation::{Back, back_target};
+        let desktop = self.platform.get().os.is_desktop();
         let modal = self
             .modals
             .iter()
             .rev()
             .filter_map(std::rc::Weak::upgrade)
-            .find(|modal| modal.is_visible());
+            .find(|modal| modal.is_desktop_focused())
+            .or_else(|| {
+                self.modals
+                    .iter()
+                    .rev()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .find(|modal| {
+                        modal.is_visible()
+                            && (!desktop
+                                || (!modal.is_desktop_window() && !modal.is_main_window_host())
+                                || modal.is_desktop_modal())
+                    })
+            });
         let target = back_target(
             modal.as_ref().and_then(|modal| modal.node_id()),
             app_listener
@@ -451,14 +502,16 @@ impl Mounter {
                 nsh_core::EventPayload::None,
             ),
             None => {
-                // BackHandler runs in the engine after the native callback has
-                // returned. If it declines and no NSH root can go back, resume
-                // the host router's default action instead of swallowing it.
-                self.host
-                    .send_host_command(crate::app::session::HostCommand {
-                        kind: "back".into(),
-                        ..Default::default()
-                    })?;
+                if !desktop {
+                    // BackHandler runs in the engine after the native callback has
+                    // returned. If it declines and no NSH root can go back, resume
+                    // the host router's default action instead of swallowing it.
+                    self.host
+                        .send_host_command(crate::app::session::HostCommand {
+                            kind: "back".into(),
+                            ..Default::default()
+                        })?;
+                }
             }
         }
         Ok(())
@@ -514,6 +567,10 @@ impl Mounter {
                 self.stacks.iter().filter_map(|id| self.nodes.get(id)),
             )?;
             for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
+                if self.is_unopened_window_container(&modal) {
+                    modal.cancel_pending_present();
+                    continue;
+                }
                 modal.present_if_pending()?;
             }
             Ok(())
@@ -535,8 +592,803 @@ impl Mounter {
         }
         res
     }
+    fn is_unopened_window_container(&self, modal: &crate::navigation::modal::Modal) -> bool {
+        if !self.platform.get().os.is_desktop()
+            || modal.has_modal_config()
+            || modal.is_desktop_window()
+            || modal.is_main_window_host()
+        {
+            return false;
+        }
+        let Some(id) = modal.node_id() else {
+            return false;
+        };
+        let Ok(node) = self.node(id) else {
+            return false;
+        };
+        node.parent.get() == Some(nsh_core::ROOT_ID)
+            && node
+                .children
+                .borrow()
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .all(|child| child.modal.borrow().is_some())
+    }
+    fn root_has_non_modal_children(&self) -> bool {
+        let Ok(root) = self.node(nsh_core::ROOT_ID) else {
+            return false;
+        };
+        root.children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|child| child.modal.borrow().is_none())
+    }
+    pub(crate) fn note_main_window_launch_applied(&mut self) {
+        self.desktop.main_window_launch_applied = true;
+    }
+    pub(crate) fn on_main_window_state(&self, state: nsh_core::desktop::WindowState) {
+        if let Some(id) = self.desktop.hosted_main_window {
+            self.control.dispatch_event(
+                id,
+                nsh_core::EventKind::Window,
+                nsh_core::EventPayload::Window(Box::new(nsh_core::desktop::WindowEvent::State(
+                    Box::new(state),
+                ))),
+            );
+        }
+    }
+    pub(crate) fn on_main_window_title_bar(&self, edges: nsh_core::Edges<nsh_core::Points>) {
+        if let Some(id) = self.desktop.hosted_main_window {
+            self.control.dispatch_event(
+                id,
+                nsh_core::EventKind::Window,
+                nsh_core::EventPayload::Window(Box::new(nsh_core::desktop::WindowEvent::TitleBar(
+                    edges,
+                ))),
+            );
+        }
+    }
+    fn apply_main_window_attributes(
+        &mut self,
+        attrs: &nsh_core::desktop::WindowAttributes,
+    ) -> Result<()> {
+        if let Some(close_on_press) = attrs.close_on_press {
+            self.desktop.close_on_press = close_on_press;
+        }
+        self.main_window.borrow_mut().apply_attributes(attrs);
+        if attrs.backdrop.is_some() {
+            self.apply_main_backdrop();
+        }
+        self.host
+            .desktop_command(&crate::services::desktop::wire_attributes(attrs))?;
+        Ok(())
+    }
+    fn open_hosted_main_window(
+        &mut self,
+        id: NodeId,
+        modal: &crate::navigation::modal::Modal,
+        open: nsh_core::desktop::OpenWindow,
+    ) -> Result<()> {
+        let root = self.node(nsh_core::ROOT_ID)?.clone();
+        modal.open_in_main_window(&root)?;
+        self.desktop.hosted_main_window = Some(id);
+        self.apply_main_window_attributes(&open.options.attributes)?;
+        if (!self.desktop.main_window_launch_applied || !open.implicit)
+            && let Some(launch) = crate::services::desktop::wire_open_main_window_launch(&open)
+        {
+            self.desktop.main_window_launch_applied = true;
+            self.host.desktop_command(&launch)?;
+        }
+        if let Some(state) = self.platform.get().window_state {
+            self.on_main_window_state(state);
+        }
+        let title_bar = self.platform.get().title_bar;
+        if title_bar != nsh_core::Edges::default() {
+            self.on_main_window_title_bar(title_bar);
+        }
+        Ok(())
+    }
     pub(crate) fn dialog_result(&mut self, id: u32, index: i32) -> Result<()> {
         self.dialogs.finish(id, index)
+    }
+    fn apply_desktop_command(
+        &mut self,
+        id: NodeId,
+        command: nsh_core::desktop::DesktopCommand,
+    ) -> Result<()> {
+        use crate::services::desktop::{
+            WireCommand, build_tray_icon, global_shortcut_registered_payload, ohos_hotkey,
+            serialize_menu_items, tray_title_text, wire_request,
+        };
+        use nsh_core::desktop::DesktopCommand;
+        if id != nsh_core::ROOT_ID {
+            if self.desktop.hosted_main_window == Some(id) {
+                match command {
+                    DesktopCommand::SetAttributes(attrs) => {
+                        self.apply_main_window_attributes(&attrs)?;
+                    }
+                    DesktopCommand::Request(request) => {
+                        if matches!(request, nsh_core::desktop::WindowRequest::Close) {
+                            self.close_desktop_children(id)?;
+                            self.close_desktop_children(nsh_core::ROOT_ID)?;
+                            self.desktop.hosted_main_window = None;
+                            if let Ok(node) = self.node(id)
+                                && let Some(modal) = node.modal.borrow().clone()
+                            {
+                                modal.close(false)?;
+                            }
+                        } else {
+                            self.host.desktop_command(&wire_request(&request))?;
+                        }
+                    }
+                    DesktopCommand::PopupMenu { items, at } => {
+                        let generation = self.desktop.next_popup_generation();
+                        let wire_items = serialize_menu_items(&items, &self.desktop.labels);
+                        let pos = at
+                            .map(|p| (p.x.0, p.y.0))
+                            .or_else(|| self.touches.borrow().last_pointer());
+                        self.host.desktop_command(&WireCommand::PopupMenu {
+                            window_id: None,
+                            generation,
+                            x: pos.map(|p| p.0),
+                            y: pos.map(|p| p.1),
+                            items: wire_items,
+                        })?;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            match command {
+                DesktopCommand::PopupMenu { items, at } => {
+                    let generation = self.desktop.next_popup_generation();
+                    let wire_items = serialize_menu_items(&items, &self.desktop.labels);
+                    let pos = at
+                        .map(|p| (p.x.0, p.y.0))
+                        .or_else(|| self.touches.borrow().last_pointer());
+                    self.host.desktop_command(&WireCommand::PopupMenu {
+                        window_id: Some(id),
+                        generation,
+                        x: pos.map(|p| p.0),
+                        y: pos.map(|p| p.1),
+                        items: wire_items,
+                    })?;
+                }
+                other => {
+                    let Ok(node) = self.node(id) else {
+                        return Ok(());
+                    };
+                    let modal = node.modal.borrow().clone();
+                    if let Some(modal) = modal {
+                        match other {
+                            DesktopCommand::OpenWindow(mut open) => {
+                                let should_host_in_main = self.desktop.hosted_main_window.is_none()
+                                    && (open.implicit
+                                        || (open.parent.is_none()
+                                            && !open.options.modal
+                                            && open.options.kind
+                                                == nsh_core::desktop::WindowKind::Normal
+                                            && !self.root_has_non_modal_children()));
+                                if should_host_in_main {
+                                    self.open_hosted_main_window(id, &modal, *open)?;
+                                } else {
+                                    if open.parent == self.desktop.hosted_main_window {
+                                        open.parent = Some(nsh_core::ROOT_ID);
+                                    }
+                                    modal.open_desktop_window(*open)?;
+                                }
+                            }
+                            DesktopCommand::SetAttributes(attrs) => {
+                                modal.set_desktop_attributes(*attrs)?;
+                            }
+                            DesktopCommand::Request(req) => modal.desktop_request(req)?,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        match command {
+            DesktopCommand::SetAttributes(attrs) => {
+                self.apply_main_window_attributes(&attrs)?;
+            }
+            DesktopCommand::Request(request) => {
+                if matches!(request, nsh_core::desktop::WindowRequest::Close) {
+                    self.close_desktop_children(nsh_core::ROOT_ID)?;
+                }
+                self.host.desktop_command(&wire_request(&request))?;
+            }
+            DesktopCommand::Quit => {
+                self.host.desktop_command(&WireCommand::Quit)?;
+            }
+            DesktopCommand::Restart => {
+                self.host.desktop_command(&WireCommand::Restart)?;
+            }
+            DesktopCommand::SetQuitOnRequest(quit) => {
+                self.desktop.quit_on_request = quit;
+                if let Some(route) = self.dispatcher.upgrade() {
+                    route.keyboard.lock().unwrap().quit_on_request = quit;
+                }
+            }
+            DesktopCommand::SetMenu(menu) => {
+                if let Some(route) = self.dispatcher.upgrade() {
+                    route.keyboard.lock().unwrap().menu = menu;
+                }
+            }
+            DesktopCommand::SetMenuLabels(labels) => {
+                self.desktop.labels = *labels;
+            }
+            DesktopCommand::PopupMenu { items, at } => {
+                let generation = self.desktop.next_popup_generation();
+                let wire_items = serialize_menu_items(&items, &self.desktop.labels);
+                let pos = at
+                    .map(|p| (p.x.0, p.y.0))
+                    .or_else(|| self.touches.borrow().last_pointer());
+                self.host.desktop_command(&WireCommand::PopupMenu {
+                    window_id: None,
+                    generation,
+                    x: pos.map(|p| p.0),
+                    y: pos.map(|p| p.1),
+                    items: wire_items,
+                })?;
+            }
+            DesktopCommand::SetTray(Some(tray)) => {
+                let items = serialize_menu_items(&tray.menu, &self.desktop.labels);
+                let icon = build_tray_icon(tray.icon.as_ref(), self.assets.as_ref());
+                self.host.desktop_command(&WireCommand::SetTray {
+                    tooltip: tray.tooltip,
+                    title: tray_title_text(&tray.title),
+                    click: tray.click,
+                    icon,
+                    items,
+                })?;
+            }
+            DesktopCommand::SetTray(None) => {
+                self.host.desktop_command(&WireCommand::RemoveTray)?;
+            }
+            DesktopCommand::RegisterGlobalShortcut { id, shortcut } => {
+                if let Some((pre_keys, final_key)) = ohos_hotkey(shortcut) {
+                    self.host
+                        .desktop_command(&WireCommand::RegisterGlobalShortcut {
+                            id,
+                            pre_keys,
+                            final_key,
+                        })?;
+                } else {
+                    let (kind, payload) = global_shortcut_registered_payload(id, false);
+                    self.control
+                        .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+                }
+            }
+            DesktopCommand::UnregisterGlobalShortcut(id) => {
+                self.host
+                    .desktop_command(&WireCommand::UnregisterGlobalShortcut { id })?;
+            }
+            DesktopCommand::OpenWindow(_)
+            | DesktopCommand::SetQuitMode(_)
+            | DesktopCommand::SetQuitRequestOptions(_)
+            | DesktopCommand::CancelQuitRequest
+            | DesktopCommand::SetMenuBar(_) => {}
+        }
+        Ok(())
+    }
+    pub(crate) fn desktop_event(
+        &mut self,
+        event: crate::services::desktop::DesktopEvent,
+    ) -> Result<()> {
+        use crate::services::desktop::{
+            DesktopEvent, WireCommand, global_shortcut_registered_payload, menu_closed_payload,
+            menu_select_payload, tray_click_payload,
+        };
+        use nsh_core::{
+            EventKind, EventPayload,
+            desktop::{WindowCloseCause, WindowEvent},
+        };
+        match event {
+            DesktopEvent::ClosePress(reason) => {
+                if let Some(window_id) = self.desktop.hosted_main_window {
+                    self.control.dispatch_event(
+                        window_id,
+                        EventKind::Window,
+                        EventPayload::Window(Box::new(WindowEvent::ClosePress { reason })),
+                    );
+                    if self.desktop.close_on_press {
+                        self.close_desktop_children(window_id)?;
+                        self.close_desktop_children(nsh_core::ROOT_ID)?;
+                        self.control.dispatch_event(
+                            window_id,
+                            EventKind::Window,
+                            EventPayload::Window(Box::new(WindowEvent::Closed {
+                                cause: WindowCloseCause::ClosePress,
+                            })),
+                        );
+                    }
+                } else {
+                    self.control.dispatch_event(
+                        nsh_core::ROOT_ID,
+                        EventKind::Window,
+                        EventPayload::Window(Box::new(WindowEvent::ClosePress { reason })),
+                    );
+                    if self.desktop.close_on_press {
+                        self.close_desktop_children(nsh_core::ROOT_ID)?;
+                        self.control.dispatch_event(
+                            nsh_core::ROOT_ID,
+                            EventKind::Window,
+                            EventPayload::Window(Box::new(WindowEvent::Closed {
+                                cause: WindowCloseCause::ClosePress,
+                            })),
+                        );
+                        self.host.desktop_command(&WireCommand::Quit)?;
+                    }
+                }
+            }
+            DesktopEvent::MenuSelect {
+                generation,
+                id,
+                role,
+            } => {
+                if generation != 0 && generation == self.desktop.popup_generation {
+                    self.desktop.popup_open = false;
+                }
+                self.desktop_menu_action(id, role)?;
+            }
+            DesktopEvent::MenuClose { generation } => {
+                if generation == self.desktop.popup_generation {
+                    self.desktop.selection_menu_target = None;
+                    if self.desktop.popup_open {
+                        self.desktop.popup_open = false;
+                        let (kind, payload) = menu_closed_payload();
+                        self.control
+                            .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+                    }
+                }
+            }
+            DesktopEvent::GlobalShortcutRegistered { id, registered } => {
+                let (kind, payload) = global_shortcut_registered_payload(id, registered);
+                self.control
+                    .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+            }
+            DesktopEvent::GlobalShortcutTrigger { id } => {
+                if id != 0 {
+                    let (kind, payload) = menu_select_payload(id);
+                    self.control
+                        .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+                }
+            }
+            DesktopEvent::TrayClick { id, bounds } => {
+                if id != 0 {
+                    let (kind, payload) = tray_click_payload(id, bounds);
+                    self.control
+                        .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+                }
+            }
+            DesktopEvent::SecondInstance(launch) => {
+                self.control.dispatch_event(
+                    nsh_core::ROOT_ID,
+                    EventKind::SecondInstance,
+                    launch.to_payload(),
+                );
+            }
+            DesktopEvent::SubWindowState { window_id, state } => {
+                if let Ok(node) = self.node(window_id)
+                    && let Some(modal) = node.modal.borrow().clone()
+                {
+                    modal.on_sub_window_state(state)?;
+                }
+            }
+            DesktopEvent::SubWindowTitleBar { window_id, edges } => {
+                if let Ok(node) = self.node(window_id)
+                    && let Some(modal) = node.modal.borrow().clone()
+                {
+                    modal.on_sub_window_title_bar(edges);
+                }
+            }
+            DesktopEvent::SubWindowClosePress { window_id, reason } => {
+                if let Ok(node) = self.node(window_id)
+                    && let Some(modal) = node.modal.borrow().clone()
+                {
+                    let parent_id = modal
+                        .desktop_parent_window_id()
+                        .unwrap_or(nsh_core::ROOT_ID);
+                    modal.on_sub_window_close_press(reason)?;
+                    if !modal.is_visible() {
+                        self.cursor.clear_window(window_id);
+                        self.close_desktop_children(window_id)?;
+                        self.request_desktop_focus_for(parent_id);
+                    }
+                }
+            }
+            DesktopEvent::SubWindowBlur { window_id } => {
+                if let Ok(node) = self.node(window_id)
+                    && let Some(modal) = node.modal.borrow().clone()
+                {
+                    let parent_id = modal
+                        .desktop_parent_window_id()
+                        .unwrap_or(nsh_core::ROOT_ID);
+                    modal.on_sub_window_blur()?;
+                    if !modal.is_visible() {
+                        self.cursor.clear_window(window_id);
+                        self.close_desktop_children(window_id)?;
+                        self.request_desktop_focus_for(parent_id);
+                    }
+                }
+            }
+            DesktopEvent::SubWindowDestroyed { window_id } => {
+                self.cursor.clear_window(window_id);
+                if let Ok(node) = self.node(window_id)
+                    && let Some(modal) = node.modal.borrow().clone()
+                {
+                    let parent_id = modal
+                        .desktop_parent_window_id()
+                        .unwrap_or(nsh_core::ROOT_ID);
+                    modal.on_sub_window_destroyed()?;
+                    self.close_desktop_children(window_id)?;
+                    self.request_desktop_focus_for(parent_id);
+                }
+            }
+            DesktopEvent::WindowState(_)
+            | DesktopEvent::TitleBar(_)
+            | DesktopEvent::Displays(_) => {}
+        }
+        Ok(())
+    }
+    fn close_desktop_children(&self, parent_id: NodeId) -> Result<()> {
+        let children: Vec<(NodeId, Rc<crate::navigation::modal::Modal>)> = self
+            .modals
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|m| m.is_desktop_window() && m.is_visible())
+            .filter(|m| m.desktop_parent_window_id() == Some(parent_id))
+            .filter_map(|m| m.node_id().map(|id| (id, m)))
+            .collect();
+        for (child_id, child) in children {
+            self.close_desktop_children(child_id)?;
+            child.close_for_parent()?;
+        }
+        Ok(())
+    }
+    fn focused_desktop_modal(&self) -> Option<Rc<crate::navigation::modal::Modal>> {
+        self.modals
+            .iter()
+            .rev()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|m| m.is_desktop_focused())
+    }
+    pub(crate) fn desktop_menu_action(
+        &mut self,
+        id: u32,
+        role: Option<nsh_core::desktop::MenuRole>,
+    ) -> Result<()> {
+        use crate::services::desktop::{WireCommand, menu_select_payload, wire_request};
+        use nsh_core::{
+            EventKind, EventPayload,
+            desktop::{MenuRole, WindowEvent, WindowMode, WindowRequest},
+        };
+        let selection_target = self.desktop.selection_menu_target.take();
+        if let Some(role) = role {
+            match role {
+                MenuRole::Quit => {
+                    if self.desktop.quit_on_request {
+                        self.host.desktop_command(&WireCommand::Quit)?;
+                    } else {
+                        self.control.dispatch_event(
+                            nsh_core::ROOT_ID,
+                            EventKind::Window,
+                            EventPayload::Window(Box::new(WindowEvent::QuitRequest)),
+                        );
+                    }
+                    return Ok(());
+                }
+                MenuRole::Close => {
+                    if let Some(modal) = self.focused_desktop_modal() {
+                        modal.on_sub_window_close_press(nsh_core::desktop::CloseReason::Menu)?;
+                        if !modal.is_visible()
+                            && let Some(window_id) = modal.node_id()
+                        {
+                            self.close_desktop_children(window_id)?;
+                        }
+                        return Ok(());
+                    }
+                    return self.desktop_event(crate::services::desktop::DesktopEvent::ClosePress(
+                        nsh_core::desktop::CloseReason::Menu,
+                    ));
+                }
+                MenuRole::Minimize => {
+                    if let Some(modal) = self.focused_desktop_modal() {
+                        modal.desktop_request(WindowRequest::Minimize)?;
+                    } else {
+                        self.host
+                            .desktop_command(&wire_request(&WindowRequest::Minimize))?;
+                    }
+                    return Ok(());
+                }
+                MenuRole::Zoom => {
+                    if let Some(modal) = self.focused_desktop_modal() {
+                        modal.desktop_toggle_maximize()?;
+                    } else {
+                        self.host
+                            .desktop_command(&WireCommand::ToggleMaximize { window_id: None })?;
+                    }
+                    return Ok(());
+                }
+                MenuRole::ToggleFullScreen => {
+                    if let Some(modal) = self.focused_desktop_modal() {
+                        modal.desktop_toggle_fullscreen()?;
+                        return Ok(());
+                    }
+                    let next = if self
+                        .platform
+                        .get()
+                        .window_state
+                        .is_some_and(|s| s.mode == WindowMode::FullScreen)
+                    {
+                        WindowMode::Normal
+                    } else {
+                        WindowMode::FullScreen
+                    };
+                    self.host
+                        .desktop_command(&wire_request(&WindowRequest::SetMode(next)))?;
+                    return Ok(());
+                }
+                MenuRole::Copy
+                | MenuRole::Cut
+                | MenuRole::SelectAll
+                | MenuRole::Paste
+                | MenuRole::Undo
+                | MenuRole::Redo => {
+                    if role == MenuRole::SelectAll
+                        && let Some(target_id) = selection_target
+                        && let Ok(target) = self.node(target_id)
+                    {
+                        if let Ok(window) = self.node(target.key_window_id())
+                            && let Some(sink) = window.focus_sink.borrow().as_ref()
+                        {
+                            let _ = sink.borrow().request_focus();
+                        }
+                        target.selection_select_all_target(true)?;
+                        return Ok(());
+                    }
+                    if matches!(role, MenuRole::Copy | MenuRole::SelectAll) {
+                        let selected = self
+                            .selected_text
+                            .borrow()
+                            .as_ref()
+                            .and_then(std::rc::Weak::upgrade);
+                        if let Some(node) = selected
+                            && node.has_selection()
+                        {
+                            let cmd = if role == MenuRole::Copy {
+                                crate::text::selection::controller::Command::Copy
+                            } else {
+                                crate::text::selection::controller::Command::SelectAll
+                            };
+                            node.selection_command(cmd)?;
+                            return Ok(());
+                        }
+                    }
+                    let focused_input = self
+                        .dispatcher
+                        .upgrade()
+                        .and_then(|route| route.keyboard.lock().unwrap().input);
+                    if let Some(input_id) = focused_input
+                        && let Ok(node) = self.node(input_id)
+                        && let Some(input) = node.input.borrow().as_ref()
+                    {
+                        match role {
+                            MenuRole::SelectAll => {
+                                input.select_all()?;
+                                return Ok(());
+                            }
+                            MenuRole::Paste => {
+                                self.host.system.paste_to_input(
+                                    &self.host,
+                                    self.dispatcher.clone(),
+                                    input_id,
+                                    input.report_paste(),
+                                )?;
+                                return Ok(());
+                            }
+                            MenuRole::Copy | MenuRole::Cut | MenuRole::Undo | MenuRole::Redo
+                                if node.interaction.mask().contains(EventKind::EditAction) =>
+                            {
+                                let action = match role {
+                                    MenuRole::Copy => "copy",
+                                    MenuRole::Cut => "cut",
+                                    MenuRole::Undo => "undo",
+                                    MenuRole::Redo => "redo",
+                                    _ => unreachable!(),
+                                };
+                                node.emit(
+                                    EventKind::EditAction,
+                                    EventPayload::Map(vec![(
+                                        "action",
+                                        nsh_core::PayloadValue::Str(action.to_owned()),
+                                    )]),
+                                );
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if id != 0 {
+            let (kind, payload) = menu_select_payload(id);
+            self.control
+                .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+        }
+        Ok(())
+    }
+    pub(crate) fn request_desktop_focus(&self) {
+        self.request_desktop_focus_for(nsh_core::ROOT_ID);
+    }
+    pub(crate) fn request_desktop_focus_for(&self, window_id: NodeId) {
+        let mut stale_other_window_focus = false;
+        let has_input_focus = self
+            .dispatcher
+            .upgrade()
+            .and_then(|route| route.keyboard.lock().unwrap().focused)
+            .is_some_and(|focused_id| {
+                if let Ok(node) = self.node(focused_id)
+                    && node.visible_in_tree()
+                    && node.key_window_id() == window_id
+                {
+                    true
+                } else {
+                    stale_other_window_focus = true;
+                    false
+                }
+            });
+        let has_child_focus = self
+            .key_focus
+            .borrow()
+            .upgrade()
+            .is_some_and(|node| node.visible_in_tree() && node.key_window_id() == window_id);
+        if has_input_focus || has_child_focus {
+            return;
+        }
+        if stale_other_window_focus && let Some(route) = self.dispatcher.upgrade() {
+            let mut keyboard = route.keyboard.lock().unwrap();
+            keyboard.focused = None;
+            keyboard.input = None;
+            keyboard.composing = false;
+        }
+        if let Ok(window) = self.node(window_id) {
+            if let Some(sink) = window.focus_sink.borrow().as_ref() {
+                let _ = sink.borrow().request_focus();
+            } else {
+                let _ = window.native.borrow().request_focus();
+            }
+        }
+    }
+    pub(crate) fn desktop_selection_menu(
+        &mut self,
+        target_id: NodeId,
+        x: f32,
+        y: f32,
+    ) -> Result<()> {
+        use crate::services::desktop::{WireCommand, WireMenuItem, serialize_menu_items};
+        use nsh_core::desktop::MenuRole;
+        let Ok(target) = self.node(target_id).cloned() else {
+            return Ok(());
+        };
+        if !(target.selectable() || target.interaction.selectable_view()) {
+            return Ok(());
+        }
+        self.desktop.selection_menu_target = Some(target_id);
+        let has_selection = self
+            .selected_text
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .is_some_and(|node| node.has_selection());
+        let mut items = Vec::new();
+        if has_selection {
+            items.push(WireMenuItem {
+                kind: "action".into(),
+                id: 0,
+                label: self.desktop.labels.label(MenuRole::Copy).to_owned(),
+                enabled: true,
+                checked: None,
+                shortcut: Some("Ctrl+C".into()),
+                role: Some("copy".into()),
+                destructive: false,
+                items: Vec::new(),
+            });
+        }
+        items.push(WireMenuItem {
+            kind: "action".into(),
+            id: 0,
+            label: self.desktop.labels.label(MenuRole::SelectAll).to_owned(),
+            enabled: true,
+            checked: None,
+            shortcut: Some("Ctrl+A".into()),
+            role: Some("selectAll".into()),
+            destructive: false,
+            items: Vec::new(),
+        });
+        let mut custom = target.interaction.selection_menu();
+        if custom.is_empty() {
+            let mut ancestor = target.parent_node.borrow().upgrade();
+            while let Some(node) = ancestor {
+                if node.interaction.selectable_view() {
+                    let menu = node.interaction.selection_menu();
+                    if !menu.is_empty() {
+                        custom = menu;
+                        break;
+                    }
+                }
+                ancestor = node.parent_node.borrow().upgrade();
+            }
+        }
+        if !custom.is_empty() {
+            let extra = serialize_menu_items(&custom, &self.desktop.labels);
+            if !extra.is_empty() {
+                items.push(WireMenuItem {
+                    kind: "separator".into(),
+                    id: 0,
+                    label: String::new(),
+                    enabled: false,
+                    checked: None,
+                    shortcut: None,
+                    role: None,
+                    destructive: false,
+                    items: Vec::new(),
+                });
+                items.extend(extra);
+            }
+        }
+        let window_id = target.key_window_id();
+        let generation = self.desktop.next_selection_popup_generation();
+        self.host.desktop_command(&WireCommand::PopupMenu {
+            window_id: (window_id != nsh_core::ROOT_ID).then_some(window_id),
+            generation,
+            x: Some(x),
+            y: Some(y),
+            items,
+        })?;
+        Ok(())
+    }
+    pub(crate) fn key_scroll(
+        &self,
+        window: NodeId,
+        key_move: nsh_core::scroll::KeyMove,
+        horizontal: bool,
+    ) -> Result<()> {
+        let mut target = self
+            .key_focus
+            .borrow()
+            .upgrade()
+            .filter(|n| n.visible_in_tree() && n.key_window_id() == window);
+        while let Some(node) = target {
+            if let Some(scroll) = node.scroll.borrow().as_ref()
+                && scroll.can_key_scroll(horizontal)
+            {
+                return scroll.key_scroll(key_move, horizontal);
+            }
+            target = node.parent_node.borrow().upgrade();
+        }
+        // Fallback: largest visible scroll view on the active window along that axis.
+        let best = self
+            .nodes
+            .values()
+            .filter(|node| node.visible_in_tree() && node.key_window_id() == window)
+            .filter_map(|node| {
+                let scroll = node.scroll.borrow().clone()?;
+                scroll.can_key_scroll(horizontal).then(|| {
+                    let frame = node.frame.get();
+                    (frame.width * frame.height, scroll)
+                })
+            })
+            .max_by(|(a, _), (b, _)| a.total_cmp(b));
+        if let Some((_, scroll)) = best {
+            scroll.key_scroll(key_move, horizontal)?;
+        }
+        Ok(())
     }
     pub(crate) fn window_environment(
         &self,
@@ -616,6 +1468,7 @@ impl Mounter {
         )));
         Ok(Self {
             dialogs: crate::services::dialogs::Dialogs::new(context.clone()),
+            desktop: Default::default(),
             context,
             mount,
             nodes: BTreeMap::from([(nsh_core::ROOT_ID, root)]),
@@ -639,6 +1492,9 @@ impl Mounter {
     }
 
     fn unlink(&mut self, id: NodeId, retain: bool) -> Result<()> {
+        if self.desktop.hosted_main_window == Some(id) {
+            self.desktop.hosted_main_window = None;
+        }
         let node = self.node(id)?;
         let parent = node.parent.get().map(|id| self.node(id)).transpose()?;
         let retain = retain && node.modal.borrow().is_none() && parent.is_some();
@@ -819,6 +1675,9 @@ impl Mounter {
     }
     fn delete_now_inner(&mut self, id: NodeId) -> Result<()> {
         self.uncreated_scroll_content.remove(&id);
+        if self.desktop.hosted_main_window == Some(id) {
+            self.desktop.hosted_main_window = None;
+        }
         if !self.nodes.contains_key(&id) {
             return Ok(());
         }
@@ -1064,10 +1923,12 @@ impl Mounter {
                         child,
                         before,
                     } => {
-                        self.detach(child).map_err(|error| match error {
-                            Error::InvalidNode(_) => Error::Tree(Box::new(error)),
-                            error => error,
-                        })?;
+                        if self.node(child)?.parent.get().is_some() {
+                            self.detach(child).map_err(|error| match error {
+                                Error::InvalidNode(_) => Error::Tree(Box::new(error)),
+                                error => error,
+                            })?;
+                        }
                         let parent = self
                             .node(parent)
                             .map_err(|error| Error::Tree(Box::new(error)))?;
@@ -1087,7 +1948,9 @@ impl Mounter {
                                 .unwrap_or(children.len())
                         };
                         if let Some(modal) = node.modal.borrow().as_ref() {
-                            modal.schedule_present();
+                            if !modal.is_desktop_window() && !modal.is_main_window_host() {
+                                modal.schedule_present();
+                            }
                         } else {
                             if !node.batch_created.get() {
                                 node.flush_deferred_native()
@@ -1408,7 +2271,9 @@ impl Mounter {
                                 .resolve(self.platform.get().color_scheme)
                                 == nsh_engine::ColorScheme::Dark,
                         )?,
-                        Command::Desktop(_) => {}
+                        Command::Desktop(desktop_cmd) => {
+                            self.apply_desktop_command(id, *desktop_cmd)?;
+                        }
                         Command::Tokens(tokens) => {
                             self.theme.borrow_mut().tokens = Some(tokens);
                             for node in self.nodes.values() {
@@ -1553,10 +2418,9 @@ impl Mounter {
                             } else if let Some(input) = self.node(id)?.input.borrow().as_ref() {
                                 input.focus(matches!(command, Command::Focus))?;
                             } else {
-                                self.node(id)?
-                                    .native
-                                    .borrow()
-                                    .set_focus_status(matches!(command, Command::Focus))?;
+                                let node = self.node(id)?.clone();
+                                node.interaction
+                                    .command_focus(&node, matches!(command, Command::Focus))?;
                             }
                         }
                         Command::SetSelection { start, end } => {
@@ -1974,6 +2838,12 @@ impl Mounter {
     pub(crate) fn close(&mut self) -> Result<()> {
         self.scroll_watchers.clear_nodes();
         self.dialogs.clear();
+        if self.desktop.popup_open {
+            self.desktop.popup_open = false;
+            let _ = self
+                .host
+                .desktop_command(&crate::services::desktop::WireCommand::ClosePopupMenu);
+        }
         let mut result = self.mount.unmount();
         if result.is_ok()
             && let Ok(root) = self.node(nsh_core::ROOT_ID)
