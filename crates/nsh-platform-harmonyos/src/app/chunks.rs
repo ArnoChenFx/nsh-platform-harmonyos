@@ -7,9 +7,12 @@ use std::sync::{Arc, Weak};
 use nsh_engine::{Bundle, BundleCode, Chunk};
 
 #[cfg(target_env = "ohos")]
-use crate::app::{
-    runtime::{Dispatcher, Message},
-    session::Services,
+use crate::{
+    app::{
+        runtime::{Dispatcher, Message},
+        session::Services,
+    },
+    services::executor::Executor,
 };
 #[cfg(target_env = "ohos")]
 pub(crate) struct ResourceChunks {
@@ -64,15 +67,15 @@ impl ResourceChunks {
         };
         let failed_route = route.clone();
         let failed_id = id.clone();
-        let result = std::thread::Builder::new()
-            .name("nsh-chunk".into())
-            .spawn(move || {
+        let result = Executor::assets().and_then(|pool| {
+            pool.submit(move || {
                 let _permit = permit;
                 let result = loader.read_chunk(&id);
                 if let Some(route) = route.upgrade() {
                     route.send(Message::Chunk(result.map_err(|e| (id, e))));
                 }
-            });
+            })
+        });
         if let Err(error) = result
             && let Some(route) = failed_route.upgrade()
         {

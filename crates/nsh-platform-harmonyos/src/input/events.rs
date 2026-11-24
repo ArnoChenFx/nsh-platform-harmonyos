@@ -24,6 +24,7 @@ use ohos_arkui_binding::{
         event::NodeEventType as E,
         gesture_direction::GestureDirection,
         gesture_event::GestureEventAction,
+        gesture_priority::GesturePriority,
         view::{AccessibilityMode, HitTestMode},
     },
 };
@@ -323,28 +324,44 @@ impl Interaction {
                                     .control
                                     .set_input_modality(nsh_core::platform::InputModality::Pointer);
                             }
-                            if owner.id == nsh_core::ROOT_ID
-                                || owner.kind == nsh_core::ViewKind::Modal
-                            {
+                            let is_root = owner.id == nsh_core::ROOT_ID
+                                || owner.kind == nsh_core::ViewKind::Modal;
+                            if is_root {
                                 owner.touches.borrow_mut().input(&owner, &input)?;
                             }
                             let x = input.pointer_x_by_index(0);
                             let y = input.pointer_y_by_index(0);
+                            let mask = owner.interaction.mask();
                             match input.action {
                                 UIInputAction::Down => {
-                                    owner
-                                        .touches
-                                        .borrow_mut()
-                                        .record_down(owner.scale.get(), &input);
+                                    if !is_root {
+                                        owner
+                                            .touches
+                                            .borrow_mut()
+                                            .record_down(owner.key_window_id(), &input);
+                                    }
                                     owner.interaction.long_fired.set(false);
                                     if owner.press_feedback_allowed() {
                                         owner.interaction.state(&owner, state::PRESSED, true)?;
-                                        owner.emit(EventKind::PressDown, owner.press_payload(x, y));
+                                        if mask.contains(EventKind::PressDown) {
+                                            owner.emit(
+                                                EventKind::PressDown,
+                                                owner.press_payload(x, y),
+                                            );
+                                        }
                                     }
                                 }
                                 UIInputAction::Up | UIInputAction::Cancel => {
+                                    if !is_root {
+                                        owner
+                                            .touches
+                                            .borrow_mut()
+                                            .record_down(owner.key_window_id(), &input);
+                                    }
                                     owner.interaction.state(&owner, state::PRESSED, false)?;
-                                    if owner.press_feedback_allowed() {
+                                    if owner.press_feedback_allowed()
+                                        && mask.contains(EventKind::PressUp)
+                                    {
                                         owner.emit(EventKind::PressUp, owner.press_payload(x, y));
                                     }
                                 }
@@ -410,7 +427,7 @@ impl Interaction {
             }
         }
         let mouse = !blocked
-            && ((is_surface_root && owner.platform.get().os.is_desktop())
+            && (is_surface_root
                 || owner.selectable()
                 || events.contains(EventKind::MouseMove)
                 || events.contains(EventKind::ContextMenu));
@@ -428,7 +445,10 @@ impl Interaction {
                             let wy = input.pointer_window_y();
                             let dx = input.pointer_display_x();
                             let dy = input.pointer_display_y();
-                            owner.touches.borrow_mut().record_pointer((wx, wy));
+                            owner
+                                .touches
+                                .borrow_mut()
+                                .record_pointer_for(owner.key_window_id(), (wx, wy));
                             let mask = owner.interaction.mask();
                             let is_root = owner.id == nsh_core::ROOT_ID
                                 || owner.kind == nsh_core::ViewKind::Modal;
@@ -513,16 +533,27 @@ impl Interaction {
                                             }
                                         }
                                         UIMouseEventButton::Right => {
+                                            let event_time = input.event_time();
                                             if mask.contains(EventKind::ContextMenu) {
-                                                owner.emit(
-                                                    EventKind::ContextMenu,
-                                                    owner.context_menu_payload(x, y),
-                                                );
+                                                if owner
+                                                    .touches
+                                                    .borrow_mut()
+                                                    .claim_context_menu(event_time, wx, wy)
+                                                {
+                                                    owner.emit(
+                                                        EventKind::ContextMenu,
+                                                        owner.context_menu_payload(x, y),
+                                                    );
+                                                }
                                             } else if is_root && desktop {
-                                                if let Some(target) =
-                                                    desktop_right_click_selection_target(
-                                                        &owner, x, y,
-                                                    )?
+                                                if owner
+                                                    .touches
+                                                    .borrow_mut()
+                                                    .claim_context_menu(event_time, wx, wy)
+                                                    && let Some(target) =
+                                                        desktop_right_click_selection_target(
+                                                            &owner, x, y,
+                                                        )?
                                                     && let Some(route) = owner.dispatcher.upgrade()
                                                 {
                                                     route.send(
@@ -536,6 +567,10 @@ impl Interaction {
                                             } else if !desktop
                                                 && owner.selectable()
                                                 && owner.has_selection()
+                                                && owner
+                                                    .touches
+                                                    .borrow_mut()
+                                                    .claim_context_menu(event_time, wx, wy)
                                             {
                                                 owner.selection_menu_show(true)?;
                                             }
@@ -716,9 +751,22 @@ impl Interaction {
                                 let _ = drag.set_drag_result(DragResult::Successful);
                                 if owner.interaction.mask().contains(EventKind::FileDrop) {
                                     let scale = owner.scale.get().max(1.0);
+                                    let surface = owner.key_surface_root();
+                                    let origin = surface
+                                        .native
+                                        .borrow()
+                                        .layout_position_in_window()
+                                        .map(|offset| (offset.x, offset.y))
+                                        .unwrap_or((0, 0));
                                     let page_position = nsh_core::Point::new(
-                                        nsh_core::Points(drag.touch_point_x_to_window() / scale),
-                                        nsh_core::Points(drag.touch_point_y_to_window() / scale),
+                                        nsh_core::Points(
+                                            (drag.touch_point_x_to_window() - origin.0 as f32)
+                                                / scale,
+                                        ),
+                                        nsh_core::Points(
+                                            (drag.touch_point_y_to_window() - origin.1 as f32)
+                                                / scale,
+                                        ),
                                     );
                                     owner.emit(
                                         EventKind::FileDrop,
@@ -740,12 +788,12 @@ impl Interaction {
                 native.off_event(E::OnDrop)?;
             }
         }
+        // 0 delegates to ArkUI's built-in system default long-press duration.
         let delay = self
             .props
             .borrow()
             .long_press_delay
-            .unwrap_or(500.0)
-            .clamp(1.0, i32::MAX as f32) as u32;
+            .map_or(0, |ms| ms.clamp(1.0, i32::MAX as f32) as u32);
         let wants_long = !blocked
             && (owner.selectable()
                 || events.contains(EventKind::LongPress)
@@ -790,6 +838,7 @@ impl Interaction {
         let window_control_changed = old_props.window_control != props.window_control;
         let focusable_changed = old_props.focusable != props.focusable
             || old_props.accessibility.state.disabled != props.accessibility.state.disabled;
+        let long_press_delay_changed = old_props.long_press_delay != props.long_press_delay;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
@@ -850,7 +899,7 @@ impl Interaction {
         self.apply_opacity(owner)?;
         if pointer_changed {
             self.pointer_internal(owner, self.inherited_block.get(), true)?;
-        } else if window_control_changed || focusable_changed {
+        } else if window_control_changed || focusable_changed || long_press_delay_changed {
             self.events(owner, self.events.get())?;
         }
         if selection_changed {
@@ -972,13 +1021,18 @@ impl Interaction {
                 continue;
             }
             let gesture = match kind {
-                0 => Gesture::create_pan_gesture(
-                    1,
-                    GestureDirection::All,
-                    10.0 * owner.scale.get() as f64,
-                )?,
-                1 => Gesture::create_pinch_gesture(2, 5.0 * owner.scale.get() as f64)?,
-                _ => Gesture::create_rotation_gesture(2, 1.0)?,
+                0 => {
+                    let direction = match (values.pan_x.is_some(), values.pan_y.is_some()) {
+                        (true, true) => GestureDirection::All,
+                        (true, false) => GestureDirection::Horizontal,
+                        (false, true) => GestureDirection::Vertical,
+                        (false, false) => GestureDirection::None,
+                    };
+                    // Pass 0.0 to use ArkUI's built-in system default threshold.
+                    Gesture::create_pan_gesture(1, direction, 0.0)?
+                }
+                1 => Gesture::create_pinch_gesture(2, 0.0)?,
+                _ => Gesture::create_rotation_gesture(2, 0.0)?,
             };
             let weak = Rc::downgrade(owner);
             gesture.on_gesture(
@@ -1101,10 +1155,15 @@ impl Interaction {
                     })
                 },
             )?;
+            let priority = if kind == 0 {
+                Some(GesturePriority::Normal)
+            } else {
+                None
+            };
             owner
                 .native
                 .borrow()
-                .add_gesture_ref(&gesture, None, None)?;
+                .add_gesture_ref(&gesture, priority, None)?;
             self.gestures.borrow_mut().push(gesture);
         }
         Ok(())

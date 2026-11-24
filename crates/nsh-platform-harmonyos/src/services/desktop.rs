@@ -20,6 +20,10 @@ use serde::{Deserialize, Serialize};
 /// application menu bar is shown.
 pub(crate) const MENU_BAR_HEIGHT: f32 = 32.0;
 
+/// Reserved `MenuSelect.generation` value for system tray right-click menu items,
+/// distinct from menu bar (`0`) and popup menu generations (`1..TRAY_MENU_GENERATION`).
+pub(crate) const TRAY_MENU_GENERATION: u32 = u32::MAX;
+
 /// Keyboard-driven transitions for the main window's application menu bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuBarKeyAction {
@@ -81,8 +85,8 @@ pub(crate) fn menu_bar_initial_index(items: &[WireMenuItem], initial: char) -> O
 }
 
 /// Whether `items` (after inline expansion) has an enabled top-level menu bar
-/// entry whose label starts with `initial` (ASCII case-insensitive).
-pub(crate) fn menu_bar_has_initial(items: &[MenuItem], initial: char) -> bool {
+/// entry whose resolved label starts with `initial` (ASCII case-insensitive).
+pub(crate) fn menu_bar_has_initial(items: &[MenuItem], initial: char, labels: &MenuLabels) -> bool {
     let target = initial.to_ascii_lowercase();
     let expanded = MenuItem::with_inline_expanded(items);
     expanded.iter().any(|item| {
@@ -92,7 +96,15 @@ pub(crate) fn menu_bar_has_initial(items: &[MenuItem], initial: char) -> bool {
                 enabled: true,
                 ..
             } => label.as_str(),
-            MenuItem::Action(action) if action.enabled => action.label.as_str(),
+            MenuItem::Action(action) if action.enabled => {
+                if !action.label.is_empty() {
+                    action.label.as_str()
+                } else if let Some(role) = action.role {
+                    labels.label(role)
+                } else {
+                    ""
+                }
+            }
             _ => return false,
         };
         label
@@ -501,16 +513,6 @@ pub(crate) enum WireCommand {
         items: Vec<WireMenuItem>,
     },
     RemoveTray,
-    #[serde(rename_all = "camelCase")]
-    RegisterGlobalShortcut {
-        id: u32,
-        pre_keys: Vec<i32>,
-        final_key: i32,
-    },
-    #[serde(rename_all = "camelCase")]
-    UnregisterGlobalShortcut {
-        id: u32,
-    },
     #[serde(rename_all = "camelCase")]
     StartMoving {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1210,6 +1212,7 @@ pub(crate) enum DesktopEvent {
     MenuClose {
         generation: u32,
     },
+    MenuBarDismissed,
     GlobalShortcutRegistered {
         id: u32,
         registered: bool,
@@ -1222,6 +1225,7 @@ pub(crate) enum DesktopEvent {
         bounds: Option<Bounds<Points>>,
     },
     SecondInstance(SecondInstance),
+    Reopen,
 }
 
 fn parse_close_reason(reason: &str) -> CloseReason {
@@ -1303,6 +1307,7 @@ pub(crate) fn parse_desktop_event(kind: &str, payload: &str) -> Option<DesktopEv
             .map(|close| DesktopEvent::MenuClose {
                 generation: close.generation,
             }),
+        "menu-bar-dismiss" => Some(DesktopEvent::MenuBarDismissed),
         "global-shortcut-registered" => {
             serde_json::from_str::<WireGlobalShortcutRegistered>(payload)
                 .ok()
@@ -1323,6 +1328,7 @@ pub(crate) fn parse_desktop_event(kind: &str, payload: &str) -> Option<DesktopEv
         "second-instance" => serde_json::from_str::<WireSecondInstance>(payload)
             .ok()
             .map(|msg| DesktopEvent::SecondInstance(SecondInstance::new(msg.args, msg.cwd))),
+        "reopen" => Some(DesktopEvent::Reopen),
         _ => None,
     }
 }
@@ -1372,13 +1378,10 @@ pub(crate) fn menu_closed_payload() -> (EventKind, EventPayload) {
     )
 }
 
-/// Converts a desktop `Shortcut` into HarmonyOS `inputConsumer.HotkeyOptions` `(preKeys, finalKey)`.
-/// `inputConsumer` requires 1..=4 modifiers from Ctrl/Alt/Shift and a non-modifier `finalKey`.
+/// Converts a desktop `Shortcut` into HarmonyOS native `OH_Input_AddHotkeyMonitor` `(pre_keys, final_key)`.
+/// Supports Ctrl/Alt/Shift/Meta modifiers, and also bare function keys `F1..=F24`.
 pub(crate) fn ohos_hotkey(shortcut: Shortcut) -> Option<(Vec<i32>, i32)> {
-    if shortcut.meta {
-        return None;
-    }
-    let mut pre_keys = Vec::with_capacity(3);
+    let mut pre_keys = Vec::with_capacity(4);
     if shortcut.ctrl {
         pre_keys.push(2072); // KEYCODE_CTRL_LEFT
     }
@@ -1388,7 +1391,11 @@ pub(crate) fn ohos_hotkey(shortcut: Shortcut) -> Option<(Vec<i32>, i32)> {
     if shortcut.shift {
         pre_keys.push(2047); // KEYCODE_SHIFT_LEFT
     }
-    if pre_keys.is_empty() {
+    if shortcut.meta {
+        pre_keys.push(2076); // KEYCODE_META_LEFT
+    }
+    let is_function_key = matches!(shortcut.key, DesktopKey::F(1..=24));
+    if pre_keys.is_empty() && !is_function_key {
         return None;
     }
     let final_key = match shortcut.key {
@@ -1438,75 +1445,6 @@ pub(crate) fn tray_title_text(runs: &[nsh_core::desktop::TrayTitleRun]) -> Strin
         out.push_str(&run.text);
     }
     out
-}
-
-/// Encodes a tray icon `ImageSource` into a wire payload for `NativeDesktop.ets`.
-/// SVGs are rasterized as 48×48 premultiplied RGBA white/black templates so the status bar
-/// icon stays crisp against both dark and light desktop wallpapers.
-#[cfg(target_env = "ohos")]
-pub(crate) fn build_tray_icon(
-    source: Option<&nsh_core::ImageSource>,
-    assets: &dyn nsh_engine::Assets,
-) -> Option<WireTrayIcon> {
-    use base64::Engine as _;
-    const TRAY_SIDE: u32 = 48;
-    const MAX_ENCODED_BYTES: usize = 2 << 20;
-
-    let source = source?;
-    let bytes: Vec<u8> = if let Some(data) = &source.data {
-        data.as_ref().to_vec()
-    } else if source.uri.starts_with("asset:/") {
-        assets.read(&source.uri).ok()?
-    } else if let Some(rest) = source.uri.strip_prefix("file://") {
-        let decoded = percent_encoding::percent_decode_str(rest).decode_utf8_lossy();
-        std::fs::read(decoded.as_ref()).ok()?
-    } else if source.uri.starts_with('/') {
-        std::fs::read(source.uri.as_ref()).ok()?
-    } else {
-        return None;
-    };
-    if bytes.is_empty() || bytes.len() > MAX_ENCODED_BYTES {
-        return None;
-    }
-
-    if nsh_core::svg::sniff(&bytes) {
-        let raster = nsh_core::svg::rasterize(&bytes, TRAY_SIDE).ok()?;
-        let fitted = nsh_core::desktop::menu_icon::canvas(
-            &raster.pixels,
-            raster.width,
-            raster.height,
-            TRAY_SIDE,
-        );
-        let mut white = vec![0u8; fitted.len()];
-        let mut black = vec![0u8; fitted.len()];
-        for (idx, chunk) in fitted.as_chunks::<4>().0.iter().enumerate() {
-            let a = chunk[3];
-            let offset = idx * 4;
-            // Premultiplied RGBA: white = (a, a, a, a), black = (0, 0, 0, a).
-            white[offset] = a;
-            white[offset + 1] = a;
-            white[offset + 2] = a;
-            white[offset + 3] = a;
-            black[offset + 3] = a;
-        }
-        return Some(WireTrayIcon {
-            format: "rgba",
-            width: Some(TRAY_SIDE),
-            height: Some(TRAY_SIDE),
-            white_base64: Some(base64::engine::general_purpose::STANDARD.encode(white)),
-            black_base64: Some(base64::engine::general_purpose::STANDARD.encode(black)),
-            data_base64: None,
-        });
-    }
-
-    Some(WireTrayIcon {
-        format: "encoded",
-        width: None,
-        height: None,
-        white_base64: None,
-        black_base64: None,
-        data_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-    })
 }
 
 /// Maps a `DesktopCommand` targeted at the main window (`ROOT_ID`) to a wire command when applicable.
@@ -1721,62 +1659,296 @@ impl MainWindowState {
 }
 
 #[cfg(target_env = "ohos")]
-pub(crate) struct DesktopState {
-    pub(crate) labels: MenuLabels,
-    pub(crate) menu: Option<std::sync::Arc<[MenuItem]>>,
-    pub(crate) menu_bar_mode: MenuBarMode,
-    pub(crate) menu_bar_alt_shown: bool,
-    pub(crate) menu_bar_inset: std::cell::Cell<f32>,
-    pub(crate) menu_bar_host: Option<(
-        crate::render::node::NativeNode,
-        crate::interop::attachment::NativeAttachment,
-    )>,
-    pub(crate) quit_on_request: bool,
-    pub(crate) popup_generation: u32,
-    pub(crate) popup_open: bool,
-    pub(crate) close_on_press: bool,
-    pub(crate) selection_menu_target: Option<nsh_core::NodeId>,
-    /// Primary desktop window node hosted in-place inside EntryAbility's main window
-    /// under NSH window model v2 (plain TSX implicit `"main"` or primary `<Window>`).
-    pub(crate) hosted_main_window: Option<nsh_core::NodeId>,
-    pub(crate) main_window_launch_applied: bool,
-}
+mod ohos {
+    use std::sync::{Arc, Weak, atomic::Ordering};
 
-#[cfg(target_env = "ohos")]
-impl Default for DesktopState {
-    fn default() -> Self {
-        Self {
-            labels: MenuLabels::default(),
-            menu: None,
-            menu_bar_mode: MenuBarMode::Shown,
-            menu_bar_alt_shown: false,
-            menu_bar_inset: std::cell::Cell::new(0.0),
-            menu_bar_host: None,
-            quit_on_request: true,
-            popup_generation: 0,
-            popup_open: false,
-            close_on_press: true,
-            selection_menu_target: None,
-            hosted_main_window: None,
-            main_window_launch_applied: false,
+    use nsh_core::{
+        Bounds, Point, Points, Size,
+        desktop::{Display, DisplayId, MenuBarMode, MenuItem, MenuLabels, Shortcut},
+    };
+    use ohos_display_binding::{
+        DisplayListener, all_displays, default_display_id, display_available_area,
+        display_position, on_available_area_change, on_display_add, on_display_change,
+        on_display_remove, primary_display,
+    };
+    use ohos_multi_modal_input_binding::{HotkeyMonitor, HotkeySpec};
+    use rustc_hash::FxHashMap;
+
+    use super::{DesktopEvent, TRAY_MENU_GENERATION, WireTrayIcon, ohos_hotkey};
+    use crate::app::runtime::{Dispatcher, Message};
+
+    /// Queries connected displays natively via `ohos-display-binding` (API 14/20).
+    pub(crate) fn read_native_displays() -> Vec<Display> {
+        let screens = match all_displays() {
+            Ok(list) if !list.is_empty() => list,
+            _ => match primary_display() {
+                Ok(primary) => vec![primary],
+                Err(_) => return Vec::new(),
+            },
+        };
+        let primary_id = primary_display()
+            .map(|d| d.id)
+            .unwrap_or_else(|_| default_display_id() as u32);
+        let has_primary = screens.iter().any(|s| s.id == primary_id);
+
+        screens
+            .into_iter()
+            .enumerate()
+            .map(|(index, info)| {
+                let scale = if info.density_pixels.is_finite() && info.density_pixels > 0.0 {
+                    (info.density_pixels * 10_000.0).round() / 10_000.0
+                } else {
+                    1.0
+                };
+                let (raw_x, raw_y) = display_position(u64::from(info.id)).unwrap_or((0, 0));
+                let (x, y) = (raw_x as f32 / scale, raw_y as f32 / scale);
+                let bounds = Bounds::new(
+                    Point::new(Points(x), Points(y)),
+                    Size::new(
+                        Points(info.width.max(0) as f32 / scale),
+                        Points(info.height.max(0) as f32 / scale),
+                    ),
+                );
+                let visible_bounds = match display_available_area(u64::from(info.id)) {
+                    Ok(a) if a.width > 0 && a.height > 0 => Bounds::new(
+                        Point::new(
+                            Points(x + a.left as f32 / scale),
+                            Points(y + a.top as f32 / scale),
+                        ),
+                        Size::new(
+                            Points(a.width as f32 / scale),
+                            Points(a.height as f32 / scale),
+                        ),
+                    ),
+                    _ => bounds,
+                };
+                let is_primary = if has_primary {
+                    info.id == primary_id
+                } else {
+                    index == 0
+                };
+                let id = DisplayId::from_name(format!("display-{}", info.id).as_bytes());
+                let trimmed = info.name.trim();
+                let label = if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("UNKNOWN") {
+                    trimmed.to_owned()
+                } else if is_primary {
+                    "Built-in Display".to_owned()
+                } else {
+                    format!("Display {}", index + 1)
+                };
+                let mut display = Display::new(id, bounds, visible_bounds, is_primary);
+                display.name = label;
+                display.scale_factor = scale;
+                display.refresh_rate = (info.refresh_rate > 0).then_some(info.refresh_rate as f32);
+                display
+            })
+            .collect()
+    }
+
+    /// RAII owner for native display hotplug/metrics listeners.
+    pub(crate) struct DisplayWatcher {
+        _listeners: Vec<DisplayListener>,
+    }
+
+    impl DisplayWatcher {
+        pub(crate) fn start<F: Fn() + Send + Sync + 'static>(on_change: F) -> Self {
+            let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(on_change);
+            let listeners = [
+                {
+                    let c = cb.clone();
+                    on_display_change(move |_| c())
+                },
+                {
+                    let c = cb.clone();
+                    on_display_add(move |_| c())
+                },
+                {
+                    let c = cb.clone();
+                    on_display_remove(move |_| c())
+                },
+                on_available_area_change(move |_| cb()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            Self {
+                _listeners: listeners,
+            }
+        }
+    }
+
+    /// Encodes a tray icon `ImageSource` into a wire payload for `NativeDesktop.ets`.
+    /// SVGs are rasterized as 48×48 premultiplied RGBA white/black templates so the status bar
+    /// icon stays crisp against both dark and light desktop wallpapers.
+    pub(crate) fn build_tray_icon(
+        source: Option<&nsh_core::ImageSource>,
+        assets: &dyn nsh_engine::Assets,
+    ) -> Option<WireTrayIcon> {
+        use base64::Engine as _;
+        const TRAY_SIDE: u32 = 48;
+        const MAX_ENCODED_BYTES: usize = 2 << 20;
+
+        let source = source?;
+        let bytes: Vec<u8> = if let Some(data) = &source.data {
+            data.as_ref().to_vec()
+        } else if source.uri.starts_with("asset:/") {
+            assets.read(&source.uri).ok()?
+        } else if let Some(rest) = source.uri.strip_prefix("file://") {
+            let decoded = percent_encoding::percent_decode_str(rest).decode_utf8_lossy();
+            std::fs::read(decoded.as_ref()).ok()?
+        } else if source.uri.starts_with('/') {
+            std::fs::read(source.uri.as_ref()).ok()?
+        } else {
+            return None;
+        };
+        if bytes.is_empty() || bytes.len() > MAX_ENCODED_BYTES {
+            return None;
+        }
+
+        if nsh_core::svg::sniff(&bytes) {
+            let raster = nsh_core::svg::rasterize(&bytes, TRAY_SIDE).ok()?;
+            let fitted = nsh_core::desktop::menu_icon::canvas(
+                &raster.pixels,
+                raster.width,
+                raster.height,
+                TRAY_SIDE,
+            );
+            let mut white = vec![0u8; fitted.len()];
+            let mut black = vec![0u8; fitted.len()];
+            for (idx, chunk) in fitted.as_chunks::<4>().0.iter().enumerate() {
+                let a = chunk[3];
+                let offset = idx * 4;
+                white[offset..offset + 4].fill(a);
+                black[offset + 3] = a;
+            }
+            return Some(WireTrayIcon {
+                format: "rgba",
+                width: Some(TRAY_SIDE),
+                height: Some(TRAY_SIDE),
+                white_base64: Some(base64::engine::general_purpose::STANDARD.encode(white)),
+                black_base64: Some(base64::engine::general_purpose::STANDARD.encode(black)),
+                data_base64: None,
+            });
+        }
+
+        Some(WireTrayIcon {
+            format: "encoded",
+            width: None,
+            height: None,
+            white_base64: None,
+            black_base64: None,
+            data_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        })
+    }
+
+    pub(crate) struct DesktopState {
+        pub(crate) labels: MenuLabels,
+        pub(crate) menu: Option<std::sync::Arc<[MenuItem]>>,
+        pub(crate) menu_bar_mode: MenuBarMode,
+        pub(crate) menu_bar_alt_shown: bool,
+        pub(crate) menu_bar_inset: std::cell::Cell<f32>,
+        pub(crate) menu_bar_host: Option<(
+            crate::render::node::NativeNode,
+            crate::interop::attachment::NativeAttachment,
+        )>,
+        pub(crate) quit_on_request: bool,
+        pub(crate) popup_generation: u32,
+        pub(crate) popup_open: bool,
+        pub(crate) close_on_press: bool,
+        pub(crate) selection_menu_target: Option<nsh_core::NodeId>,
+        pub(crate) hosted_main_window: Option<nsh_core::NodeId>,
+        pub(crate) main_window_launch_applied: bool,
+        pub(crate) hotkeys: FxHashMap<u32, HotkeyMonitor>,
+    }
+
+    impl Default for DesktopState {
+        fn default() -> Self {
+            Self {
+                labels: MenuLabels::default(),
+                menu: None,
+                menu_bar_mode: MenuBarMode::Shown,
+                menu_bar_alt_shown: false,
+                menu_bar_inset: std::cell::Cell::new(0.0),
+                menu_bar_host: None,
+                quit_on_request: true,
+                popup_generation: 0,
+                popup_open: false,
+                close_on_press: true,
+                selection_menu_target: None,
+                hosted_main_window: None,
+                main_window_launch_applied: false,
+                hotkeys: FxHashMap::default(),
+            }
+        }
+    }
+
+    impl DesktopState {
+        fn advance_popup_generation(&mut self) -> u32 {
+            let mut next = self.popup_generation.wrapping_add(1);
+            if next == 0 || next == TRAY_MENU_GENERATION {
+                next = 1;
+            }
+            self.popup_generation = next;
+            next
+        }
+
+        pub(crate) fn next_popup_generation(&mut self) -> u32 {
+            let generation = self.advance_popup_generation();
+            self.popup_open = true;
+            generation
+        }
+
+        pub(crate) fn next_selection_popup_generation(&mut self) -> u32 {
+            let generation = self.advance_popup_generation();
+            self.popup_open = false;
+            generation
+        }
+
+        /// Registers a global hotkey natively via `ohos-multi-modal-input-binding`.
+        pub(crate) fn register_global_shortcut(
+            &mut self,
+            id: u32,
+            shortcut: Shortcut,
+            route: Weak<Dispatcher>,
+        ) -> bool {
+            self.hotkeys.remove(&id);
+            let Some((pre_keys, final_key)) = (id != 0).then(|| ohos_hotkey(shortcut)).flatten()
+            else {
+                return false;
+            };
+            let spec = HotkeySpec::new(pre_keys, final_key);
+            match HotkeyMonitor::register(&spec, move |_| {
+                if let Some(d) = route.upgrade().filter(|d| d.live.load(Ordering::Acquire)) {
+                    d.send(Message::HostDesktop(DesktopEvent::GlobalShortcutTrigger {
+                        id,
+                    }));
+                }
+            }) {
+                Ok(monitor) => {
+                    self.hotkeys.insert(id, monitor);
+                    true
+                }
+                Err(error) => {
+                    log::warn!(
+                        "OHOS native global shortcut registration failed (id={id}): {error}"
+                    );
+                    false
+                }
+            }
+        }
+
+        pub(crate) fn unregister_global_shortcut(&mut self, id: u32) {
+            self.hotkeys.remove(&id);
+        }
+
+        pub(crate) fn clear_hotkeys(&mut self) {
+            self.hotkeys.clear();
         }
     }
 }
 
 #[cfg(target_env = "ohos")]
-impl DesktopState {
-    pub(crate) fn next_popup_generation(&mut self) -> u32 {
-        self.popup_generation = self.popup_generation.wrapping_add(1).max(1);
-        self.popup_open = true;
-        self.popup_generation
-    }
-
-    pub(crate) fn next_selection_popup_generation(&mut self) -> u32 {
-        self.popup_generation = self.popup_generation.wrapping_add(1).max(1);
-        self.popup_open = false;
-        self.popup_generation
-    }
-}
+pub(crate) use ohos::{DesktopState, DisplayWatcher, build_tray_icon, read_native_displays};
 
 #[cfg(test)]
 mod tests {
@@ -1937,14 +2109,31 @@ mod tests {
                 items: Vec::new(),
             },
         ];
-        let wire_items = serialize_menu_items(&top_items, &MenuLabels::default());
+        let labels = MenuLabels::default();
+        let wire_items = serialize_menu_items(&top_items, &labels);
         assert_eq!(menu_bar_first_index(&wire_items), Some(1));
         assert_eq!(menu_bar_initial_index(&wire_items, 'f'), Some(1));
         assert_eq!(menu_bar_initial_index(&wire_items, 'e'), None);
         assert_eq!(menu_bar_initial_index(&wire_items, 'V'), Some(3));
-        assert!(menu_bar_has_initial(&top_items, 'f'));
-        assert!(!menu_bar_has_initial(&top_items, 'e'));
-        assert!(menu_bar_has_initial(&top_items, 'V'));
+        assert!(menu_bar_has_initial(&top_items, 'f', &labels));
+        assert!(!menu_bar_has_initial(&top_items, 'e', &labels));
+        assert!(menu_bar_has_initial(&top_items, 'V', &labels));
+
+        // Top-level MenuRole item with empty custom label resolves via MenuLabels.
+        let role_items = vec![MenuItem::Action(MenuAction {
+            id: 0,
+            label: String::new(),
+            shortcut: None,
+            enabled: true,
+            checked: None,
+            role: Some(MenuRole::Quit),
+            when: When::Always,
+            icon: None,
+            symbol: None,
+            destructive: false,
+        })];
+        assert!(menu_bar_has_initial(&role_items, 'q', &labels));
+        assert!(!menu_bar_has_initial(&role_items, 'z', &labels));
 
         let wire = serde_json::to_value(&WireCommand::SetMenuBar {
             visible: true,
@@ -2132,9 +2321,30 @@ mod tests {
         let digit = Shortcut::parse("ctrl+9", false).unwrap();
         assert_eq!(ohos_hotkey(digit), Some((vec![2072], 2009)));
 
-        // Unmodified or Meta shortcuts are rejected by OHOS inputConsumer.
+        // Meta modifier and bare function keys are supported natively.
+        assert_eq!(
+            ohos_hotkey(Shortcut::parse("cmd+k", true).unwrap()),
+            Some((vec![2076], 2027))
+        );
+        assert_eq!(
+            ohos_hotkey(Shortcut::parse("f5", false).unwrap()),
+            Some((vec![], 2094))
+        );
+
+        // Unmodified non-function keys are rejected.
         assert_eq!(ohos_hotkey(Shortcut::parse("k", false).unwrap()), None);
-        assert_eq!(ohos_hotkey(Shortcut::parse("cmd+k", true).unwrap()), None);
+    }
+
+    #[test]
+    fn desktop_events_parse_menu_bar_dismiss_and_reopen() {
+        assert_eq!(
+            parse_desktop_event("menu-bar-dismiss", "{}"),
+            Some(DesktopEvent::MenuBarDismissed)
+        );
+        assert_eq!(
+            parse_desktop_event("reopen", "{}"),
+            Some(DesktopEvent::Reopen)
+        );
     }
 
     #[test]
