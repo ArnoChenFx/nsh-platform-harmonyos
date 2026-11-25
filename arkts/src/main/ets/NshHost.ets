@@ -32,6 +32,7 @@ import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames"
 
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
+import { startAbilityForResult } from "./NativeExtensions";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -142,6 +143,21 @@ interface NshNativeModule {
   ): void;
   nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void;
   nshPickImagesResult(sessionId: number, pickId: number, files: PickedDescriptor[]): void;
+  nshRunUiTask(
+    sessionId: number,
+    taskId: number,
+    uiContext: UIContext,
+    bundleName: string,
+    moduleName?: string,
+  ): void;
+  nshAbilityResult(
+    sessionId: number,
+    requestId: number,
+    ok: boolean,
+    payload?: string,
+    code?: number,
+    message?: string,
+  ): void;
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
@@ -994,6 +1010,11 @@ class HostSession {
     );
   }
 
+  private moduleName(): string {
+    const name = this.abilityContext.abilityInfo?.moduleName;
+    return typeof name === "string" && name.length > 0 ? name : "entry";
+  }
+
   private updateSystemBars(command?: HostCommandPayload): void {
     if (this.isDesktop) {
       return;
@@ -1144,6 +1165,29 @@ class HostSession {
       // Programmatic router back resumes the host's default return without
       // re-entering the page's onBackPress and its NSH BackHandler listeners.
       this.runtimeContext.getUIContext().getRouter().back();
+      return;
+    }
+    if (command.kind === "ui-task") {
+      this.mod.nshRunUiTask(
+        this.sessionId,
+        command.openId ?? 0,
+        this.runtimeContext.getUIContext(),
+        this.bundleName(),
+        this.moduleName(),
+      );
+      return;
+    }
+    if (command.kind === "ability-start-for-result") {
+      const requestId = command.openId ?? 0;
+      startAbilityForResult(
+        this.abilityContext,
+        command.text ?? "{}",
+        (ok: boolean, payload?: string, code?: number, message?: string): void => {
+          if (!this.closed) {
+            this.mod.nshAbilityResult(this.sessionId, requestId, ok, payload, code, message);
+          }
+        },
+      );
       return;
     }
     if (command.kind === "system") {
@@ -1380,7 +1424,8 @@ class HostSession {
   }
 }
 
-getNativeModule().nshRegisterSessionBinder(
+const nativeHostModule = getNativeModule();
+nativeHostModule.nshRegisterSessionBinder(
   deviceInfo.sdkApiVersion,
   (uiContext: UIContext): number => HostSession.bind(uiContext),
   showNativeAlert,
