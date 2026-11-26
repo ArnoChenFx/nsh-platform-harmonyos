@@ -1,3 +1,4 @@
+import { abilityAccessCtrl, Permissions } from "@kit.AbilityKit";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
 import { BuilderNode } from "@ohos.arkui.node";
 import picker from "@ohos.file.picker";
@@ -146,6 +147,13 @@ struct WebViewHost {
           scriptRules: documentStartScriptRules(this.entry.settings.urlSchemes),
         },
       ])
+      .mediaPlayGestureAccess(false)
+      .onPermissionRequest((event) => {
+        if (!event) {
+          return;
+        }
+        this.entry.handlePermissionRequest(event.request);
+      })
       .onShowFileSelector((event): boolean => {
         if (!event) {
           return false;
@@ -557,6 +565,65 @@ class WebEntry {
         this.settings.htmlBaseUrl ?? "about:blank",
         " ",
       );
+    }
+  }
+
+  handlePermissionRequest(request: PermissionRequest): void {
+    const epoch = this.epoch;
+    this.resolvePermissionRequest(request, epoch).catch((error: Error) => {
+      console.warn(`NSH WebView permission request: ${String(error)}`);
+      try {
+        request.deny();
+      } catch {}
+    });
+  }
+
+  private async resolvePermissionRequest(
+    request: PermissionRequest,
+    epoch: number,
+  ): Promise<void> {
+    if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
+      request.deny();
+      return;
+    }
+    const resources = request.getAccessibleResource();
+    const permissions: Permissions[] = [];
+    const grantedResources: string[] = [];
+    for (const resource of resources) {
+      if (resource === ProtectedResourceType.VIDEO_CAPTURE) {
+        permissions.push("ohos.permission.CAMERA");
+        grantedResources.push(resource);
+      } else if (resource === ProtectedResourceType.AUDIO_CAPTURE) {
+        permissions.push("ohos.permission.MICROPHONE");
+        grantedResources.push(resource);
+      }
+    }
+    if (permissions.length === 0) {
+      request.deny();
+      return;
+    }
+    const host = this.context.getUIContext().getHostContext();
+    if (!host) {
+      request.deny();
+      return;
+    }
+    const result = await abilityAccessCtrl
+      .createAtManager()
+      .requestPermissionsFromUser(host, permissions);
+    if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
+      request.deny();
+      return;
+    }
+    const allowed: string[] = [];
+    for (let i = 0; i < grantedResources.length; i += 1) {
+      if (result.authResults[i] === 0) {
+        allowed.push(grantedResources[i]);
+      }
+    }
+    if (allowed.length > 0) {
+      request.grant(allowed);
+    } else {
+      request.deny();
     }
   }
 
