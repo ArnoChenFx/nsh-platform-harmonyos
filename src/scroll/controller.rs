@@ -34,6 +34,19 @@ use crate::{
 
 const KEY_SCROLL_PAGE_OVERLAP_VP: f32 = 40.0;
 
+fn apply_scrollbar_margin(
+    node: &ohos_arkui_binding::common::node::ArkUINode,
+    start: f32,
+    end: f32,
+) -> Result<()> {
+    if start > 0.0 || end > 0.0 {
+        node.set_number_attribute(A::ScrollBarMargin, vec![N::Float(start), N::Float(end)])?;
+    } else {
+        node.reset_attribute(A::ScrollBarMargin)?;
+    }
+    Ok(())
+}
+
 pub(crate) struct Scroller {
     pub(crate) native: NativeNode,
     pub(crate) wrapper: NativeNode,
@@ -86,6 +99,13 @@ impl Scroller {
     #[cfg(feature = "dev")]
     pub(crate) fn test_animating(&self) -> bool {
         self.phases.get() != [0; 2] || self.zoom_motion.get().is_some()
+    }
+    pub(crate) fn is_scrolling(&self) -> bool {
+        self.phases.get() != [0; 2]
+    }
+    pub(crate) fn is_zoomable(&self) -> bool {
+        let behavior = self.behavior.borrow();
+        behavior.max_zoom > behavior.min_zoom
     }
     pub(crate) fn mounted(&self) -> NativeNode {
         self.overlay
@@ -244,6 +264,18 @@ impl Scroller {
                     {
                         route.send(crate::app::runtime::Message::FlushScrollLayout(owner.id));
                     }
+                }
+                Ok(())
+            })
+        });
+        let weak = Rc::downgrade(&scroll);
+        scroll.content.borrow_mut().on_axis(move |event| {
+            callback(|| {
+                if let Some(scroll) = weak.upgrade()
+                    && let Some(owner) = scroll.owner.upgrade()
+                    && let Some(input) = event.input_event()
+                {
+                    crate::input::events::handle_axis_event(&owner, &input)?;
                 }
                 Ok(())
             })
@@ -692,6 +724,20 @@ impl Scroller {
                 .borrow()
                 .set_i32_attribute(A::ScrollBarDisplayMode, if indicator { 1 } else { 0 })?;
         }
+        drop(native);
+        let behavior = self.behavior.borrow();
+        let (start, end) = if !behavior.zooms() && horizontal {
+            (
+                behavior.scrollbar_inset.left.0.max(0.0),
+                behavior.scrollbar_inset.right.0.max(0.0),
+            )
+        } else {
+            (
+                behavior.scrollbar_inset.top.0.max(0.0),
+                behavior.scrollbar_inset.bottom.0.max(0.0),
+            )
+        };
+        apply_scrollbar_margin(&self.native.borrow(), start, end)?;
         Ok(())
     }
     pub(crate) fn behavior(self: &Rc<Self>, behavior: &ScrollBehavior) -> Result<()> {
@@ -1256,6 +1302,7 @@ impl Scroller {
     pub(crate) fn dispose(&self) -> Result<()> {
         self.phases.set([0; 2]);
         self.zoom_motion.set(None);
+        let _ = self.content.borrow_mut().off_event(E::OnAxis);
         use ohos_arkui_binding::component::attribute::ArkUIGesture;
         if let Some(gesture) = self.pinch.borrow_mut().take()
             && self.wrapper.borrow().is_owned()
@@ -1743,7 +1790,26 @@ impl Scroller {
                 A::ScrollEnableScrollInteraction,
                 !self.blocked.get() && self.behavior.borrow().enabled,
             )?;
+            let inset = self.behavior.borrow().scrollbar_inset;
+            apply_scrollbar_margin(
+                &cross.borrow(),
+                inset.left.0.max(0.0),
+                inset.right.0.max(0.0),
+            )?;
         }
+        let behavior = self.behavior.borrow();
+        let (start, end) = if !zooms && self.horizontal.get() {
+            (
+                behavior.scrollbar_inset.left.0.max(0.0),
+                behavior.scrollbar_inset.right.0.max(0.0),
+            )
+        } else {
+            (
+                behavior.scrollbar_inset.top.0.max(0.0),
+                behavior.scrollbar_inset.bottom.0.max(0.0),
+            )
+        };
+        apply_scrollbar_margin(&self.native.borrow(), start, end)?;
         self.native.borrow().set_i32_attribute(
             A::ScrollScrollDirection,
             i32::from(if !zooms && self.horizontal.get() {

@@ -79,8 +79,8 @@ pub(crate) struct AvoidArea {
 #[napi(object)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostInit {
-    pub speech_available: bool,
     pub share_available: Option<bool>,
+    pub speech_available: Option<bool>,
     pub sdk_api_version: i32,
     pub device_type: String,
     pub cache_dir: String,
@@ -116,6 +116,7 @@ pub(crate) struct HostCommand {
     pub limit: Option<u32>,
     pub filters: Option<Vec<String>>,
     pub url: Option<String>,
+    pub orientations: Option<u32>,
 }
 
 pub(crate) type HostCommandCallback =
@@ -240,11 +241,11 @@ enum Operation {
 type PendingPick = (u32, nsh_core::picker::Pick, Weak<Dispatcher>);
 
 pub(crate) struct Services {
-    pub(crate) speech_available: bool,
     pub(crate) share_available: bool,
     id: u32,
     active: AtomicBool,
     appearance: std::sync::atomic::AtomicU8,
+    orientations: std::sync::atomic::AtomicU8,
     pixel_ratio: AtomicU32,
     max_refresh_rate: AtomicU32,
     loads: AtomicUsize,
@@ -504,12 +505,14 @@ impl Services {
         }
         *self.focused.lock().unwrap() = route;
         self.apply_selected_status();
+        self.apply_selected_orientations();
     }
 
     pub(crate) fn select_surface(&self, owner: Weak<crate::app::surface::Queue>) {
         *self.selected.lock().unwrap() = owner;
         *self.focused.lock().unwrap() = Weak::new();
         self.apply_selected_status();
+        self.apply_selected_orientations();
     }
 
     fn selected_route(&self) -> Option<Arc<Dispatcher>> {
@@ -605,6 +608,33 @@ impl Services {
             route.status_bar_configured.store(true, Ordering::Release);
             *route.status_bar.lock().unwrap() = Some((config, dark));
             self.apply_selected_status();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_selected_orientations(&self) {
+        let desktop = self.environment.lock().unwrap().idiom.as_deref() == Some("desktop");
+        let desired = if desktop {
+            0
+        } else {
+            self.selected_route()
+                .map_or(0, |route| route.orientations.load(Ordering::Acquire))
+        };
+        if self.orientations.swap(desired, Ordering::AcqRel) != desired
+            && let Err(error) = self.send_host_command(HostCommand {
+                kind: "orientations".into(),
+                orientations: Some(u32::from(desired)),
+                ..Default::default()
+            })
+        {
+            log::warn!("OHOS orientation update: {error}");
+        }
+    }
+
+    pub(crate) fn orientations(&self, route: Weak<Dispatcher>, bits: u8) -> Result<()> {
+        if let Some(route) = route.upgrade() {
+            route.orientations.store(bits, Ordering::Release);
+            self.apply_selected_orientations();
         }
         Ok(())
     }
@@ -976,12 +1006,13 @@ impl Services {
             Vec::new()
         };
         let (queue, receiver) = mpsc::sync_channel(256);
+        let speech_available = init.speech_available.unwrap_or(false);
         let services = Arc::new(Self {
-            speech_available: init.speech_available,
             share_available: init.share_available.unwrap_or(false),
             id,
             active: AtomicBool::new(true),
             appearance: std::sync::atomic::AtomicU8::new(0),
+            orientations: std::sync::atomic::AtomicU8::new(0),
             pixel_ratio: AtomicU32::new((init.pixel_ratio as f32).to_bits()),
             max_refresh_rate: AtomicU32::new(init.max_refresh_rate.unwrap_or_else(|| {
                 ohos_display_binding::default_display_refresh_rate().unwrap_or(0)
@@ -1112,6 +1143,7 @@ impl Services {
             sessions.insert(id, Arc::downgrade(&services));
         }
         HAS_CREATED_SESSION.store(true, Ordering::Release);
+        crate::services::speech::on_session_created(speech_available);
         Ok(id)
     }
 
@@ -1203,6 +1235,7 @@ impl Services {
             self.keyboard.lock().unwrap().take();
             self.open_urls.lock().unwrap().clear();
             self.picks.lock().unwrap().clear();
+            crate::services::speech::on_session_closed(self.id);
             crate::extensions::on_session_closed(self.id);
             self.broadcast(|| Message::HostClosed);
             let _ = self.queue.try_send(Operation::Stop);

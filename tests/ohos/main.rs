@@ -110,3 +110,27 @@ mod web_downloads;
 #[path = "../../src/extensions.rs"]
 #[allow(dead_code, unreachable_pub)]
 mod extensions;
+
+#[path = "../../src/services/network_monitor.rs"]
+#[allow(dead_code)]
+mod network_monitor;
+
+#[path = "../../src/services/net.rs"]
+#[allow(dead_code)]
+mod net;
+
+#[path = "../../src/services/speech.rs"]
+#[allow(dead_code)]
+mod speech;
+
+mod services {
+    pub(crate) use super::desktop;
+}
+
+#[path = "../../src/input/pan.rs"]
+#[allow(dead_code)]
+mod pan;
+
+#[path = "../../src/input/wheel.rs"]
+#[allow(dead_code)]
+mod wheel;

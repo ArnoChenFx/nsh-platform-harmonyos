@@ -26,6 +26,7 @@ export interface Settings {
   textureSurface?: string;
   textureInsets?: TextureInsets | null;
   targetId: number;
+  windowId?: number | null;
   testId?: string | null;
   width: number;
   height: number;
@@ -107,6 +108,8 @@ const roles: Map<string, AccessibilityRoleType> = new Map([
   ["grid", AccessibilityRoleType.GRID],
   ["progress", AccessibilityRoleType.PROGRESS],
   ["search", AccessibilityRoleType.SEARCH],
+  ["textbox", AccessibilityRoleType.TEXT_INPUT],
+  ["tabpanel", AccessibilityRoleType.TAB_CONTENT],
   ["menuitem", AccessibilityRoleType.MENU_ITEM],
   ["text", AccessibilityRoleType.TEXT],
 ]);
@@ -155,7 +158,7 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
     const keyFocusable = s.keyFocusable === true && !s.disabled;
     node
       .enabled(!s.disabled)
-      .onClick(s.clickable || keyFocusable || s.menu != null ? (): void => {} : undefined)
+      .onClick(s.clickable || s.menu != null ? (): void => {} : undefined)
       .focusOnTouch(keyFocusable);
     // Do not call `.focusable(false)` on the wrapper `Stack`: in ArkUI that
     // disables focus for the entire descendant subtree (including child editors).
@@ -327,7 +330,11 @@ class ViewEntry {
     this.state = new ViewState(settings);
     this.menus = menus;
     this.context = context;
-    this.ui = context.getUIContext();
+    const windowUi =
+      settings.windowId !== undefined && settings.windowId !== null
+        ? context.getWindowUIContext?.(settings.windowId)
+        : undefined;
+    this.ui = windowUi ?? context.getUIContext();
     if (settings.textureSurface !== undefined) {
       this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, {
         type: NodeRenderType.RENDER_TYPE_TEXTURE,
@@ -468,6 +475,12 @@ class ViewEntry {
     if (this.focusPending && !this.closed && this.context.isActive()) {
       this.focusPending = false;
       this.requestViewFocus();
+    } else if (!this.closed && this.context.isActive() && this.settings.windowId != null) {
+      this.context.viewAction({
+        targetId: this.settings.targetId,
+        action: "appear",
+        kind: "focus",
+      });
     }
   }
   focusEvent(name: string): void {

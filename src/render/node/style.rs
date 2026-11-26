@@ -4,7 +4,9 @@ use std::rc::Rc;
 
 use nsh_core::{ViewKind, ViewStyle};
 use ohos_arkui_binding::{
-    common::attribute::ArkUINodeAttributeNumber as Number,
+    common::attribute::{
+        ArkUINodeAttributeItem, ArkUINodeAttributeNumber as Number, ArkUINodeCompositeAttributeItem,
+    },
     component::attribute::ArkUICommonAttribute,
     types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
@@ -19,6 +21,9 @@ impl Node {
         self.update_layout_bounds()?;
         if let Some(video) = self.video.borrow().as_ref() {
             video.density_changed(self.scale.get())?;
+        }
+        if let Some(self_rc) = self.self_ref() {
+            self.interaction.sync_gestures(&self_rc)?;
         }
         self.restore_style()?;
         self.animator.apply_node(self)?;
@@ -41,7 +46,7 @@ impl Node {
                 ViewKind::Scroll | ViewKind::Image | ViewKind::Stack | ViewKind::Input
             )
             || self.modal.borrow().as_ref().is_some_and(|modal| {
-                if modal.is_main_window_host() {
+                if modal.is_main_window_host() || modal.is_sub_window_modal() {
                     false
                 } else if modal.is_desktop_window() {
                     !modal.desktop_transparent()
@@ -208,6 +213,7 @@ impl Node {
         let mut applied = self.applied.get();
         if applied.visual_ptr != ptr {
             applied.visual_ptr = ptr;
+            applied.clip_path = None;
             applied.visibility = 0;
             applied.transform = None;
             applied.transform_center = [f32::NAN; 3];
@@ -220,6 +226,7 @@ impl Node {
             applied.z_index = 0;
             self.applied.set(applied);
             self.interaction.invalidate_opacity();
+            self.interaction.invalidate_wrapper_clip();
         }
     }
     fn unhidden_for_effects(&self, style: &ViewStyle) -> bool {
@@ -388,6 +395,7 @@ impl Node {
         let native = node.borrow();
         native.reset_attribute(Attribute::LayoutRect)?;
         native.reset_attribute(Attribute::Position)?;
+        native.reset_attribute(Attribute::ClipShape)?;
         native.reset_attribute(Attribute::Transform)?;
         native.reset_attribute(Attribute::TransformCenter)?;
         native.reset_attribute(Attribute::Blur)?;
@@ -456,7 +464,7 @@ impl Node {
         let (color, _) = crate::render::shadow_geometry::effective_background(base_color, style);
         let default_surface_bg = self.kind == ViewKind::Screen
             || self.modal.borrow().as_ref().is_some_and(|modal| {
-                if modal.is_main_window_host() {
+                if modal.is_main_window_host() || modal.is_sub_window_modal() {
                     false
                 } else if modal.is_desktop_window() {
                     !modal.desktop_transparent()
@@ -497,7 +505,10 @@ impl Node {
         if let Some(modal) = self.modal.borrow().as_ref()
             && radius == [0.0; 4]
         {
-            if modal.is_desktop_window() || modal.is_main_window_host() {
+            if modal.is_desktop_window()
+                || modal.is_main_window_host()
+                || modal.is_sub_window_modal()
+            {
                 // Desktop windows own their OS window chrome and corner radius natively.
                 radius = [0.0; 4];
             } else {
@@ -625,6 +636,8 @@ impl Node {
         Ok(())
     }
     pub(crate) fn apply_clip(&self) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
         let clip = self.clips_children();
         let mut applied = self.applied.get();
         if applied.clip != clip {
@@ -640,6 +653,38 @@ impl Node {
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             }
+        }
+        let next_clip_path = self.style.borrow().clip_path().copied().map(|clip_path| {
+            let frame = self.frame.get();
+            (
+                frame.width.max(0.0),
+                frame.height.max(0.0),
+                self.scale.get(),
+                clip_path,
+            )
+        });
+        if applied.clip_path != next_clip_path {
+            let native = visual.borrow();
+            if let Some((width, height, scale, ref clip_path)) = next_clip_path {
+                let svg =
+                    crate::render::effects::clip_inset_svg_path(clip_path, width, height, scale);
+                native.set_clip_shape(ArkUINodeAttributeItem::Composite(
+                    ArkUINodeCompositeAttributeItem::new()
+                        .with_number_values(vec![
+                            Number::Int(3),
+                            Number::Float(width),
+                            Number::Float(height),
+                        ])
+                        .with_string(svg),
+                ))?;
+            } else {
+                native.reset_attribute(Attribute::ClipShape)?;
+            }
+            drop(native);
+            applied.clip_path = next_clip_path;
+            self.applied.set(applied);
+            self.interaction.hit_region(self)?;
+            self.interaction.sync_clip_intercept(self)?;
         }
         Ok(())
     }

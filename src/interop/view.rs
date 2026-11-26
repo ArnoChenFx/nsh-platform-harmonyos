@@ -281,11 +281,15 @@ impl Wrapper {
         {
             return Ok(false);
         }
+        let window_id = {
+            let id = owner.key_window_id();
+            (id != nsh_core::ROOT_ID).then_some(id)
+        };
         if self
             .settings
             .borrow()
             .as_ref()
-            .is_some_and(|s| s.texture_surface != texture_surface)
+            .is_some_and(|s| s.texture_surface != texture_surface || s.window_id != window_id)
         {
             self.replace_target(owner)?;
             self.settings.borrow_mut().take();
@@ -296,7 +300,7 @@ impl Wrapper {
         let frame = owner.frame.get();
         let value = crate::accessibility::value::spoken_value_for_locale(
             &spec,
-            owner.platform.get().locale.as_str(),
+            owner.spoken_locale().as_str(),
         )
         .unwrap_or_default();
         let actions: Vec<MenuItem> = if cfg!(feature = "api-26") {
@@ -317,6 +321,7 @@ impl Wrapper {
             texture_surface,
             texture_insets: Some(self.insets()),
             target_id,
+            window_id,
             test_id: owner.interaction.test_id(),
             width: frame.width as f64,
             height: frame.height as f64,
@@ -339,8 +344,8 @@ impl Wrapper {
             } else {
                 String::new()
             },
-            hint: spec.hint.as_deref().unwrap_or("").to_owned(),
-            api23: cfg!(feature = "api-23") && !value.is_empty(),
+            hint: spec.help_text(None).unwrap_or_default(),
+            api23: cfg!(feature = "api-23"),
             api26: !actions.is_empty(),
             value,
             role: crate::accessibility::value::role_str(spec.role).to_owned(),
@@ -602,7 +607,9 @@ impl Node {
             let frame = self.frame.get();
             let size = Some((frame.width, frame.height));
             let resized = wrapper.measured.replace(size) != size;
-            let modal = self.modal.borrow().is_some();
+            let modal = self.modal.borrow().as_ref().is_some_and(|m| {
+                !m.is_desktop_window() && !m.is_sub_window_modal() && !m.is_main_window_host()
+            });
             if changed || composite || modal || resized {
                 wrapper
                     .outer
@@ -611,6 +618,67 @@ impl Node {
             }
         }
         self.composite_dirty.set(false);
+        Ok(())
+    }
+    pub(crate) fn on_subtree_attached(&self) -> Result<()> {
+        self.invalidate_composites();
+        if let Some(wrapper) = self
+            .wrapper
+            .borrow()
+            .as_ref()
+            .filter(|wrapper| !wrapper.closed.get())
+        {
+            // Force a fresh outer measure/layout/render pass now that the
+            // ArkTS BuilderNode and inner native subtree are attached.
+            wrapper.measured.set(None);
+            let outer = wrapper.outer.borrow();
+            outer.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+            outer.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            outer.mark_dirty(NodeDirtyFlag::NeedRender)?;
+        }
+        if let Some(parent) = self.mount_parent.borrow().upgrade() {
+            let borrowed = parent.borrow();
+            let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedMeasure);
+            let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedLayout);
+            let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedRender);
+        }
+        if self.kind == nsh_core::ViewKind::Modal {
+            fn mark_modal_descendants_dirty(node: &Node) {
+                let children: Vec<Rc<Node>> = node
+                    .children
+                    .borrow()
+                    .iter()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .collect();
+                for child in children {
+                    if child.kind == nsh_core::ViewKind::Modal {
+                        continue;
+                    }
+                    let mounted = child.mounted();
+                    {
+                        let borrowed = mounted.borrow();
+                        let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedMeasure);
+                        let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedLayout);
+                        let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedRender);
+                    }
+                    if !Rc::ptr_eq(&mounted, &child.native) {
+                        let borrowed = child.native.borrow();
+                        let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedMeasure);
+                        let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedLayout);
+                        let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedRender);
+                    }
+                    if child.has_custom_paint() {
+                        let _ = child.invalidate_paint();
+                    }
+                    mark_modal_descendants_dirty(&child);
+                }
+            }
+            mark_modal_descendants_dirty(self);
+        }
+        self.update_wrapper()?;
+        if let Some(modal) = self.modal.borrow().as_ref() {
+            modal.sync_sub_window_focus_after_attach();
+        }
         Ok(())
     }
     pub(crate) fn wrapper_semantics_reset(&self) {

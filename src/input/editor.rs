@@ -85,12 +85,15 @@ impl Input {
                 _ => None,
             };
             if let Some(stroke) = stroke {
-                let matched = route.keyboard.lock().unwrap().map.find_in(
-                    owner.key_window_id(),
-                    stroke,
-                    true,
-                    false,
-                );
+                let matched = {
+                    let snapshot = route.keyboard.lock().unwrap();
+                    snapshot.map.find_in(
+                        snapshot.keymap_window(owner.key_window_id()),
+                        stroke,
+                        true,
+                        false,
+                    )
+                };
                 if let Some(id) = matched.fired() {
                     route.send(crate::app::runtime::Message::HostEvent(
                         EventKind::KeyCommand,
@@ -140,6 +143,14 @@ impl Input {
         input.listen();
         Ok(input)
     }
+    pub(crate) fn is_editable(&self) -> bool {
+        !self.closed.get() && self.config.borrow().editable
+    }
+
+    pub(crate) fn paste_max_size(&self) -> Option<u64> {
+        self.config.borrow().paste_max_size
+    }
+
     fn target_id(&self) -> Option<u32> {
         self.target.borrow().as_ref().map(NativeAttachment::id)
     }
@@ -198,6 +209,47 @@ impl Input {
     pub(crate) fn report_paste(&self) -> bool {
         self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report
     }
+    pub(crate) fn paste_edit_gen(&self) -> u64 {
+        self.state.borrow().edit_gen
+    }
+    pub(crate) fn plan_insert(
+        &self,
+        current: &str,
+        start: u32,
+        end: u32,
+        inserted: &str,
+        normalize_paste: bool,
+    ) -> editor_state::PlannedEdit {
+        let config = self.config.borrow();
+        let multiline = config.multiline && !config.secure;
+        let digits_only = config.keyboard == KeyboardType::Number;
+        editor_state::plan_insert(
+            current,
+            start,
+            end,
+            inserted,
+            config.max_length,
+            multiline,
+            normalize_paste,
+            digits_only,
+        )
+    }
+    pub(crate) fn plan_replace(
+        &self,
+        previous: &str,
+        candidate: &str,
+    ) -> editor_state::PlannedEdit {
+        let config = self.config.borrow();
+        let multiline = config.multiline && !config.secure;
+        let digits_only = config.keyboard == KeyboardType::Number;
+        editor_state::plan_replace(
+            previous,
+            candidate,
+            config.max_length,
+            multiline,
+            digits_only,
+        )
+    }
     pub(crate) fn is_ime_cursor_sink(&self) -> bool {
         let config = self.config.borrow();
         !config.secure
@@ -231,15 +283,23 @@ impl Input {
                     event.html,
                     event.files,
                     event.image,
+                    event
+                        .image_too_large
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| v.round() as u64),
+                    self.config.borrow().paste_max_size,
                 ))),
             ),
             "edit-action" => {
                 if event.text == "paste" {
+                    let config = self.config.borrow();
                     owner.host.system.paste_to_input(
                         &owner.host,
                         owner.dispatcher.clone(),
                         owner.id,
-                        self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report,
+                        config.paste_behavior == nsh_core::PasteBehavior::Report,
+                        config.paste_max_size,
+                        self.paste_edit_gen(),
                     )?;
                 } else {
                     owner.emit(
@@ -283,7 +343,7 @@ impl Input {
                 }
             }
             "scroll" => {
-                if self.config.borrow().replaced {
+                if self.config.borrow().report_scroll {
                     let content = self.content.get();
                     owner.control.input_scroll(
                         owner.id,
@@ -370,6 +430,7 @@ impl Input {
                     let window = owner.key_window_id();
                     let (select_id, delete_id) = {
                         let snapshot = route.keyboard.lock().unwrap();
+                        let window = snapshot.keymap_window(window);
                         (
                             snapshot.map.find_in(
                                 window,
@@ -414,18 +475,21 @@ impl Input {
             "undo" => {
                 if let Some(route) = owner.dispatcher.upgrade() {
                     use nsh_core::keymap::{Key, Keystroke, Modifiers};
-                    let matched = route.keyboard.lock().unwrap().map.find_in(
-                        owner.key_window_id(),
-                        Keystroke {
-                            key: Key::Char('z'),
-                            modifiers: Modifiers {
-                                ctrl: true,
-                                ..Modifiers::default()
+                    let matched = {
+                        let snapshot = route.keyboard.lock().unwrap();
+                        snapshot.map.find_in(
+                            snapshot.keymap_window(owner.key_window_id()),
+                            Keystroke {
+                                key: Key::Char('z'),
+                                modifiers: Modifiers {
+                                    ctrl: true,
+                                    ..Modifiers::default()
+                                },
                             },
-                        },
-                        true,
-                        false,
-                    );
+                            true,
+                            false,
+                        )
+                    };
                     if let Some(id) = matched.fired() {
                         route.send(crate::app::runtime::Message::HostEvent(
                             EventKind::KeyCommand,
@@ -543,7 +607,13 @@ impl Input {
             below_viewport: false,
             accessibility: Some(EditorAccessibility {
                 label: accessibility.label.as_deref().unwrap_or("").to_owned(),
-                hint: accessibility.hint.as_deref().unwrap_or("").to_owned(),
+                hint: accessibility.help_text(None).unwrap_or_default(),
+                state_description: crate::accessibility::value::spoken_value_for_locale(
+                    &accessibility,
+                    owner.spoken_locale().as_str(),
+                )
+                .unwrap_or_default(),
+                api23: cfg!(feature = "api-23"),
                 hidden: accessibility.hidden,
                 accessible: accessibility.accessible,
                 disabled: accessibility.state.disabled,
@@ -574,8 +644,11 @@ impl Input {
             editable: config.editable,
             auto_correct: config.auto_correct,
             report_paste: config.paste_behavior == nsh_core::PasteBehavior::Report,
+            listens_paste: owner.interaction.mask().contains(EventKind::Paste),
+            paste_max_size: config.paste_max_size.map(|m| m as f64),
             edit_actions: Some(owner.interaction.mask().contains(EventKind::EditAction)),
-            scrollbar_visible: config.scrollbar_visible && !config.replaced,
+            select_text_on_focus: config.select_text_on_focus,
+            scrollbar_visible: config.scrollbar_visible,
             hit_test: self.hit_test.get(),
             align: match config.align {
                 TextAlign::Center => 1,
@@ -697,32 +770,65 @@ impl Input {
         Ok(())
     }
     pub(crate) fn insert_text(&self, text: String) -> Result<()> {
+        self.insert_text_kind("insert", text)
+    }
+    fn insert_text_kind(&self, kind: &str, text: String) -> Result<()> {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
             && let Some(target_id) = self.target_id()
         {
             owner.editor_command(EditorCommand {
                 target_id,
-                kind: "insert".into(),
+                kind: kind.into(),
                 text: Some(text),
                 ..Default::default()
             });
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_paste(
         &self,
         text: String,
         html: Option<String>,
         files: Option<String>,
         image: Option<String>,
-        report_only: bool,
+        image_too_large: Option<u64>,
+        _report_only: bool,
+        expected_edit_gen: u64,
     ) -> Result<()> {
-        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) {
-            let paste = build_paste_event(text.clone(), html, files, image);
-            owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(paste)));
-            if !report_only && self.config.borrow().editable && !text.is_empty() {
-                self.insert_text(text)?;
-            }
+        let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
+            return Ok(());
+        };
+        // Reject stale async clipboard completions if the editor's text changed
+        // or another input took focus while reading the clipboard.
+        if self.state.borrow().edit_gen != expected_edit_gen {
+            return Ok(());
+        }
+        if let Some(route) = owner.dispatcher.upgrade()
+            && let Some(active_input) = route.keyboard.lock().unwrap().input
+            && active_input != owner.id
+        {
+            return Ok(());
+        }
+        let (report_only, editable, paste_max_size) = {
+            let config = self.config.borrow();
+            (
+                config.paste_behavior == nsh_core::PasteBehavior::Report,
+                config.editable,
+                config.paste_max_size,
+            )
+        };
+        let paste = build_paste_event(
+            text.clone(),
+            html,
+            files,
+            image,
+            image_too_large,
+            paste_max_size,
+        );
+        owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(paste)));
+        if !report_only && editable && !text.is_empty() {
+            self.insert_text_kind("paste-insert", text)?;
         }
         Ok(())
     }
@@ -817,6 +923,8 @@ fn build_paste_event(
     html: Option<String>,
     files: Option<String>,
     image: Option<String>,
+    image_too_large: Option<u64>,
+    paste_max_size: Option<u64>,
 ) -> nsh_core::PasteEvent {
     let mut paste = nsh_core::PasteEvent::new(text);
     paste.html = html.unwrap_or_default();
@@ -837,8 +945,22 @@ fn build_paste_event(
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())
             && !bytes.is_empty()
         {
-            paste.files.push(nsh_core::PastedFile::image(bytes));
+            if paste_max_size.is_some_and(|max| bytes.len() as u64 > max) {
+                paste.too_large.push(nsh_core::PastedFile::too_large(
+                    "image.png",
+                    "image/png",
+                    bytes.len() as u64,
+                ));
+            } else {
+                paste.files.push(nsh_core::PastedFile::image(bytes));
+            }
         }
+    } else if let Some(len) = image_too_large.filter(|&len| len > 0) {
+        paste.too_large.push(nsh_core::PastedFile::too_large(
+            "image.png",
+            "image/png",
+            len,
+        ));
     }
     paste
 }

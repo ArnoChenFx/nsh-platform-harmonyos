@@ -328,7 +328,7 @@ impl Node {
             y: anchor.1.clamp(-16384.0, 16384.0) as f64,
             items: {
                 let (copy_label, select_all_label) =
-                    localized_selection_labels(self.platform.get().locale.as_str());
+                    localized_selection_labels(self.spoken_locale().as_str());
                 vec![
                     ViewAction {
                         kind: "action".into(),
@@ -385,11 +385,9 @@ impl Node {
                     .map(|a| a.text())
                     .transpose()?
                     .unwrap_or_default();
-                self.host.system.command(
-                    &self.host,
-                    self.dispatcher.clone(),
-                    nsh_core::Command::SetClipboard(text),
-                )?;
+                if !text.is_empty() {
+                    self.host.system.copy_clipboard(text)?;
+                }
                 self.selection_clear()?;
             }
             Command::SelectAll => {

@@ -119,13 +119,16 @@ pub(crate) enum Message {
         html: Option<String>,
         files: Option<String>,
         image: Option<String>,
+        image_too_large: Option<u64>,
         report_only: bool,
+        expected_edit_gen: u64,
     },
     DialogResult {
         id: u32,
         index: i32,
     },
     HostEnvironment(NshEnvironment),
+    HostNetwork(nsh_core::platform::Network),
     HostFontsChanged,
     HostWindow(
         [crate::app::session::AvoidArea; 3],
@@ -266,6 +269,7 @@ pub(crate) struct Dispatcher {
     pub(crate) manages_status_bar: bool,
     pub(crate) status_bar_configured: std::sync::atomic::AtomicBool,
     pub(crate) status_bar: std::sync::Mutex<Option<(nsh_core::StatusBarConfig, bool)>>,
+    pub(crate) orientations: std::sync::atomic::AtomicU8,
     pub(crate) keyboard: std::sync::Mutex<crate::input::keyboard::Snapshot>,
 }
 impl Dispatcher {
@@ -433,6 +437,7 @@ struct State {
     attached: bool,
     visible: bool,
     frame_wanted: bool,
+    ui_active: bool,
     retiring_dispatcher: Option<Arc<Dispatcher>>,
     #[cfg(feature = "dev")]
     reload: Option<(u64, std::sync::Weak<crate::app::surface::Queue>)>,
@@ -544,14 +549,18 @@ impl State {
                 html,
                 files,
                 image,
+                image_too_large,
                 report_only,
+                expected_edit_gen,
             } => self.mounter.as_ref().unwrap().input_paste(
                 id,
                 text,
                 html,
                 files,
                 image,
+                image_too_large,
                 report_only,
+                expected_edit_gen,
             )?,
             Message::ReconcileNavigation => {
                 let mounter = self.mounter.as_mut().unwrap();
@@ -563,6 +572,18 @@ impl State {
                 self.mounter.as_mut().unwrap().dialog_result(id, index)?;
             }
             Message::HostEnvironment(changes) => self.update_environment(changes)?,
+            Message::HostNetwork(network) => {
+                if self.environment.network != network {
+                    self.environment.network = network;
+                    let effective = self.effective_environment(self.environment);
+                    if let Some(engine) = &self.engine {
+                        engine.control().set_environment(effective);
+                    }
+                    if let Some(mounter) = &mut self.mounter {
+                        mounter.environment(effective)?;
+                    }
+                }
+            }
             Message::HostFontsChanged => {
                 self.engine.as_ref().unwrap().control().fonts_changed();
                 self.mounter.as_ref().unwrap().invalidate_canvases()?;
@@ -704,6 +725,7 @@ impl State {
             }
             Message::RequestFrame => self.request_frame()?,
             Message::EngineFrameRequested => {
+                self.frame_rate.record_engine_request();
                 if self.laid_out
                     && self.is_active()
                     && self.engine_in_flight == 0
@@ -782,6 +804,7 @@ impl State {
             }
             log::warn!("OHOS mount resource skipped: {error}");
         }
+        self.frame_rate.record_mount_request();
         self.request_frame()?;
         Ok(())
     }
@@ -834,6 +857,7 @@ impl State {
         if idiom_changed {
             let os = crate::services::desktop::os_for_idiom(environment.idiom);
             environment.os = os;
+            environment.app_settings = !os.is_desktop();
             if let Some(dispatcher) = self.dispatcher.upgrade() {
                 dispatcher.keyboard.lock().unwrap().desktop = os.is_desktop();
             }
@@ -856,6 +880,9 @@ impl State {
         self.environment = environment;
         let mut updated = Ok(());
         if let Some(mounter) = &self.mounter {
+            if idiom_changed {
+                mounter.host.apply_selected_orientations();
+            }
             if lifecycle_changed && environment.lifecycle != nsh_engine::Lifecycle::Active {
                 updated = updated.and(mounter.cancel_input());
             }
@@ -885,8 +912,7 @@ impl State {
         });
     }
     fn step_frame(&mut self, timestamp: u64) -> Result<bool> {
-        let rate_driver = self.rate_driver.as_ref().unwrap().clone();
-        if !self.is_active() || !rate_driver.active() {
+        if !self.is_active() || !self.ui_active {
             return Ok(false);
         }
         if std::mem::take(&mut self.engine_wanted) {
@@ -901,39 +927,43 @@ impl State {
             worker.frame(timestamp);
         }
         self.native_demand = sampled.as_ref().copied().unwrap_or_default();
+        if self.native_demand != super::frame_rate::UiDemand::Idle {
+            self.frame_rate.record_animation_frame();
+        }
         let retired = self.retire();
         let scheduled = self.schedule_frame();
         self.update_back();
         sampled?;
         retired?;
         scheduled?;
-        Ok(rate_driver.active())
+        Ok(self.ui_active)
     }
     fn request_frame(&mut self) -> Result<()> {
         self.frame_wanted = true;
         self.schedule_frame()
     }
     fn schedule_frame(&mut self) -> Result<()> {
-        use super::frame_rate::UiDemand;
-        let demand = if self.engine_wanted || self.engine_in_flight > 0 || self.frame_wanted {
-            UiDemand::Uncapped
-        } else {
-            self.native_demand
-        };
-        self.frame_rate.set_ui_demand(demand);
-        let active =
-            self.is_active() && (demand != UiDemand::Idle || self.frame_rate.has_shader_demand());
+        let schedule = super::frame_rate::classify_frame_schedule(
+            self.is_active(),
+            self.engine_wanted || self.engine_in_flight > 0,
+            self.native_demand,
+            self.frame_rate.has_shader_demand(),
+            self.frame_wanted,
+        );
+        self.frame_rate.set_ui_demand(schedule.rate_demand);
         let rate_driver = self.rate_driver.as_ref().unwrap();
-        rate_driver.set_active(active)?;
+        rate_driver.set_active(schedule.rate_active)?;
         if let Err(error) = self
             .phase
             .as_ref()
             .unwrap()
-            .set_running(active, self.frame_rate.desired_range())
+            .set_running(schedule.ui_active, self.frame_rate.desired_range())
         {
+            self.ui_active = false;
             let _ = rate_driver.set_active(false);
             return Err(error.into());
         }
+        self.ui_active = schedule.ui_active;
         Ok(())
     }
     fn retire(&mut self) -> Result<()> {
@@ -955,6 +985,7 @@ impl State {
         self.engine_wanted = false;
         self.engine_in_flight = 0;
         self.frame_wanted = false;
+        self.ui_active = false;
         self.native_demand = super::frame_rate::UiDemand::Idle;
         self.frame_rate
             .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
@@ -966,6 +997,9 @@ impl State {
             {
                 self.retiring_dispatcher = Some(dispatcher.clone());
             }
+            dispatcher
+                .orientations
+                .store(0, std::sync::atomic::Ordering::Release);
             dispatcher
                 .active
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -995,6 +1029,7 @@ impl State {
         let closed = if let Some(mounter) = &mut self.mounter {
             mounter.host.system.retire(&mounter.host, &self.dispatcher);
             mounter.host.apply_selected_status();
+            mounter.host.apply_selected_orientations();
             mounter.close()
         } else {
             Ok(())
@@ -1103,13 +1138,13 @@ impl BootedEngine {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
             clipboard_images: Some(true),
+            clipboard_write_result: true,
             canvas_render: true,
             webview_requests: true,
             auth_session: true,
             web_input: true,
             web_evaluate: true,
             notifications: true,
-            speech: config.host.speech_available,
             share: config.host.share_available,
             file_requests: true,
             audio: true,
@@ -1143,6 +1178,8 @@ impl BootedEngine {
         let mut environment = config.environment.clone().apply(environment)?;
         let os = crate::services::desktop::os_for_idiom(environment.idiom);
         environment.os = os;
+        environment.app_settings = !os.is_desktop();
+        environment.network = crate::services::network_monitor::current_network();
         let initial_displays = if os.is_desktop() {
             let (window_state, title_bar, displays) = config.host.desktop_snapshot();
             environment.window_state = window_state;
@@ -1203,7 +1240,6 @@ impl BootedEngine {
             clipboard: None,
             host: config.channel.clone(),
             picker: None,
-            speech: None,
             audio: None,
             windows: None,
             login_item: None,
@@ -1471,6 +1507,7 @@ impl Runtime {
             attached,
             visible,
             frame_wanted: false,
+            ui_active: false,
             retiring_dispatcher: None,
             environment: Environment::default(),
             #[cfg(feature = "dev")]
@@ -1560,6 +1597,7 @@ impl Runtime {
             manages_status_bar: config.manages_status_bar,
             status_bar_configured: std::sync::atomic::AtomicBool::new(false),
             status_bar: std::sync::Mutex::new(None),
+            orientations: std::sync::atomic::AtomicU8::new(0),
             keyboard: std::sync::Mutex::default(),
             live: std::sync::atomic::AtomicBool::new(true),
         });
@@ -1649,6 +1687,9 @@ impl Runtime {
             compositor: std::cell::RefCell::default(),
             composite_nodes: std::cell::RefCell::default(),
             key_focus: RefCell::default(),
+            nodes_index: RefCell::default(),
+            modals_index: RefCell::default(),
+            axis_routers: RefCell::default(),
             selected_text: RefCell::default(),
             accessibility_dirty: RefCell::default(),
             accessibility_focus: RefCell::default(),
@@ -1675,6 +1716,7 @@ impl Runtime {
             canvas_bytes: Rc::new(Cell::new(0)),
             fonts: booted.fonts.clone(),
             platform: Cell::new(environment),
+            text_locale: Cell::new(None),
             main_window: RefCell::new(initial_main_window),
             appearance: Cell::new(nsh_core::platform::Appearance::System),
         });
@@ -1692,6 +1734,11 @@ impl Runtime {
         // Keep rollback ownership before registering with the shared session.
         // A rejected route must still close the engine and detach its root.
         config.host.attach(Arc::downgrade(&runtime._dispatcher))?;
+        let initial_network = runtime.state.borrow().environment.network;
+        crate::services::network_monitor::subscribe(
+            Arc::downgrade(&runtime._dispatcher),
+            initial_network,
+        );
         if drain_buffered && let Some(buffered) = booted.gate.attach(runtime._dispatcher.clone()) {
             let chunks = booted.chunks.clone();
             let dispatcher_weak = Arc::downgrade(&runtime._dispatcher);

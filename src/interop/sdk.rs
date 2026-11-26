@@ -32,7 +32,10 @@ pub(crate) struct EditorSettings {
     pub editable: bool,
     pub auto_correct: bool,
     pub report_paste: bool,
+    pub listens_paste: bool,
+    pub paste_max_size: Option<f64>,
     pub edit_actions: Option<bool>,
+    pub select_text_on_focus: bool,
     pub scrollbar_visible: bool,
     pub hit_test: u32,
     pub align: u32,
@@ -53,6 +56,8 @@ pub(crate) struct EditorSettings {
 pub(crate) struct EditorAccessibility {
     pub label: String,
     pub hint: String,
+    pub state_description: String,
+    pub api23: bool,
     pub hidden: bool,
     pub accessible: Option<bool>,
     pub disabled: bool,
@@ -90,6 +95,7 @@ pub(crate) struct EditorEvent {
     pub html: Option<String>,
     pub files: Option<String>,
     pub image: Option<String>,
+    pub image_too_large: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,7 +109,17 @@ pub(crate) struct EditorKeyEvent {
     pub alt: bool,
     pub shift: bool,
     pub cmd: bool,
+    pub caps_lock: Option<bool>,
     pub timestamp: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+#[napi(object)]
+pub(crate) struct EditorPlannedEdit {
+    pub text: String,
+    pub clipped: String,
+    pub caret: u32,
+    pub changed: bool,
 }
 
 #[napi(object)]
@@ -151,6 +167,7 @@ pub(crate) struct TextureInsets {
 #[napi(object)]
 pub(crate) struct ViewOptions {
     pub target_id: u32,
+    pub window_id: Option<u32>,
     pub width: f64,
     pub height: f64,
     pub texture_insets: Option<TextureInsets>,
@@ -188,6 +205,7 @@ pub(crate) struct WebSettings {
     pub load_generation: u32,
     pub java_script_enabled: bool,
     pub scroll_enabled: bool,
+    pub zoomable: bool,
     pub user_agent: Option<String>,
     pub injected_javascript: Option<String>,
     pub document_start_script: String,
@@ -228,6 +246,8 @@ pub(crate) struct WebEvent {
     pub message: Option<String>,
     pub code: Option<i32>,
     pub download: Option<WebDownload>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
 }
 
 #[napi(object)]
@@ -370,9 +390,8 @@ pub(crate) fn nsh_attach_native_subtree(
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
     NativeAttachment::attach_subtree(&env, target_id, &content, &slot)?;
-    owner.invalidate_composites();
     owner
-        .update_wrapper()
+        .on_subtree_attached()
         .map_err(|e| Error::from_reason(e.to_string()))?;
 
     Ok(())
@@ -410,6 +429,66 @@ pub(crate) fn nsh_editor_key_event(target_id: u32, event: EditorKeyEvent) -> Res
 }
 
 #[napi]
+pub(crate) fn nsh_editor_plan_edit(
+    target_id: u32,
+    current: String,
+    start: u32,
+    end: u32,
+    inserted: String,
+    normalize_paste: bool,
+) -> Result<EditorPlannedEdit> {
+    let planned = EDITORS.with(|routes| {
+        routes
+            .borrow()
+            .get(&target_id)
+            .and_then(Weak::upgrade)
+            .map(|input| input.plan_insert(&current, start, end, &inserted, normalize_paste))
+    });
+    let planned = planned.unwrap_or_else(|| {
+        crate::input::editor_state::plan_insert(
+            &current,
+            start,
+            end,
+            &inserted,
+            None,
+            false,
+            normalize_paste,
+            false,
+        )
+    });
+    Ok(EditorPlannedEdit {
+        text: planned.text,
+        clipped: planned.clipped,
+        caret: planned.caret,
+        changed: planned.changed,
+    })
+}
+
+#[napi]
+pub(crate) fn nsh_editor_plan_replace(
+    target_id: u32,
+    previous: String,
+    candidate: String,
+) -> Result<EditorPlannedEdit> {
+    let planned = EDITORS.with(|routes| {
+        routes
+            .borrow()
+            .get(&target_id)
+            .and_then(Weak::upgrade)
+            .map(|input| input.plan_replace(&previous, &candidate))
+    });
+    let planned = planned.unwrap_or_else(|| {
+        crate::input::editor_state::plan_replace(&previous, &candidate, None, false, false)
+    });
+    Ok(EditorPlannedEdit {
+        text: planned.text,
+        clipped: planned.clipped,
+        caret: planned.caret,
+        changed: planned.changed,
+    })
+}
+
+#[napi]
 pub(crate) fn nsh_view_action(action: MenuAction) -> Result<bool> {
     NativeAttachment::dispatch(action.target_id, || {
         let owner = VIEWS.with(|views| {
@@ -427,6 +506,11 @@ pub(crate) fn nsh_view_action(action: MenuAction) -> Result<bool> {
                         accepted = true;
                     } else if action.action == "blur" {
                         owner.emit(nsh_core::EventKind::Blur, nsh_core::EventPayload::None);
+                        accepted = true;
+                    } else if action.action == "appear" {
+                        if let Some(modal) = owner.modal.borrow().as_ref() {
+                            modal.sync_sub_window_focus_after_attach();
+                        }
                         accepted = true;
                     }
                 } else if action.kind.is_some() {
