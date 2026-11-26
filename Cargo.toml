@@ -26,7 +26,7 @@ path = "src/main.rs"
 # the app needs).
 default = []
 # What the HarmonyOS library is built with.
-backend = ["editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "zlib", "crypto"]
+backend = ["editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "zlib", "crypto", "websocket"]
 dev = ["dep:nsh-dev", "dep:nsh-testing", "dep:url"]
 # Registers the HarmonyOS HMS speech recognizer with `nsh-extra`'s `speech`
 # module when an app enables `nsh-extra`'s `speech` feature.
@@ -53,6 +53,9 @@ emoji-picker = ["nsh-base/emoji-picker"]
 zlib = ["nsh-engine/zlib"]
 # The standard JS module `crypto` and the globals of Web Crypto.
 crypto = ["nsh-engine/crypto"]
+# The native WebSocket client (`websocket` module `connect`). Without it,
+# `connect` rejects with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`.
+websocket = ["nsh-engine/websocket"]
 # Linked enhancements raise the minimum supported runtime API.
 api-23 = [
   "ohos-arkui-binding/accessibility",
