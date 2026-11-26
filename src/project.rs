@@ -15,7 +15,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    module_meta::{HarmonyMeta, OhpmDep, Permission, permission_reason_key},
+    module_meta::{HarmonyMeta, OhpmDep, Permission, UsedScene, permission_reason_key},
     paths::{join_all, join_relative},
     sdk::{ApiLevel, Arch},
 };
@@ -48,9 +48,20 @@ pub(crate) struct AppConfig {
     pub(crate) file_types: Vec<nsh_core::file_type::FileType>,
     /// Standalone apps declaring WebView can initialize ArkWeb before accepting input.
     webview: bool,
+    /// Web pages may use the microphone (`capabilities.webview.media`).
+    web_microphone: bool,
+    /// Web pages may use the camera (`capabilities.webview.media`).
+    web_camera: bool,
     /// HarmonyOS packaging declarations from `nsh.json` `"harmonyos"` merged
     /// with crates' `[package.metadata.nsh.harmonyos]`.
     pub(crate) harmonyos: HarmonyMeta,
+}
+
+/// Whether `capabilities.webview.media` grants `kind` (`"microphone"`, `"camera"`).
+fn web_media(json: &Value, kind: &str) -> bool {
+    json.pointer("/capabilities/webview/media")
+        .and_then(Value::as_array)
+        .is_some_and(|m| m.iter().any(|k| k.as_str() == Some(kind)))
 }
 
 impl AppConfig {
@@ -107,6 +118,8 @@ impl AppConfig {
             links,
             file_types,
             webview: json["capabilities"]["webview"].is_object(),
+            web_microphone: web_media(json, "microphone"),
+            web_camera: web_media(json, "camera"),
             harmonyos,
         })
     }
@@ -377,7 +390,11 @@ fn indent_json(value: &Value, indent: usize) -> String {
     out
 }
 
-fn build_permissions_and_strings(harmonyos: &HarmonyMeta) -> (String, String) {
+fn build_permissions_and_strings(
+    harmonyos: &HarmonyMeta,
+    web_microphone: bool,
+    web_camera: bool,
+) -> (String, String) {
     // Haptics has no nsh capability; VIBRATE is a normal permission for every app.
     let mut permissions = vec![
         Permission {
@@ -405,6 +422,41 @@ fn build_permissions_and_strings(harmonyos: &HarmonyMeta) -> (String, String) {
                 }
                 if extra.used_scene.is_some() {
                     existing.used_scene = extra.used_scene.clone();
+                }
+            }
+        }
+    }
+    for (declared, name, default_reason) in [
+        (
+            web_microphone,
+            "ohos.permission.MICROPHONE",
+            "The app's web pages use the microphone.",
+        ),
+        (
+            web_camera,
+            "ohos.permission.CAMERA",
+            "The app's web pages use the camera.",
+        ),
+    ] {
+        if !declared {
+            continue;
+        }
+        let default_scene = || UsedScene {
+            abilities: vec!["EntryAbility".to_owned()],
+            when: "inuse".to_owned(),
+        };
+        match permissions.iter_mut().find(|p| p.name == name) {
+            None => permissions.push(Permission {
+                name: name.to_owned(),
+                reason: Some(default_reason.to_owned()),
+                used_scene: Some(default_scene()),
+            }),
+            Some(existing) => {
+                if existing.reason.is_none() {
+                    existing.reason = Some(default_reason.to_owned());
+                }
+                if existing.used_scene.is_none() {
+                    existing.used_scene = Some(default_scene());
                 }
             }
         }
@@ -1318,7 +1370,8 @@ pub(crate) fn write(
         }
     }
 
-    let (request_permissions, entry_strings) = build_permissions_and_strings(&config.harmonyos);
+    let (request_permissions, entry_strings) =
+        build_permissions_and_strings(&config.harmonyos, config.web_microphone, config.web_camera);
     let module_extras = build_module_extras(&config.harmonyos);
     let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
@@ -2612,6 +2665,86 @@ mod tests {
         );
         assert_eq!(runtime_types["extensions"], json!([]));
         assert_eq!(runtime_types["mimeTypes"], json!([]));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_app_whose_pages_capture_media_declares_its_permissions() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-web-media-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let app_dir = dir.join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let render = |json: Value| -> (Value, Value) {
+            let config = AppConfig::from_json(&app_dir, &json).unwrap();
+            let (perms, strings) = build_permissions_and_strings(
+                &config.harmonyos,
+                config.web_microphone,
+                config.web_camera,
+            );
+            (
+                serde_json::from_str(&perms).unwrap(),
+                serde_json::from_str(&strings).unwrap(),
+            )
+        };
+
+        // Not declared: neither MICROPHONE nor CAMERA is emitted.
+        for json in [
+            json!({}),
+            json!({ "capabilities": { "webview": { "hosts": ["*"] } } }),
+        ] {
+            let (perms, _) = render(json);
+            let list = perms.as_array().unwrap();
+            assert!(
+                !list
+                    .iter()
+                    .any(|p| p["name"] == "ohos.permission.MICROPHONE")
+            );
+            assert!(!list.iter().any(|p| p["name"] == "ohos.permission.CAMERA"));
+        }
+
+        // Only microphone declared.
+        let (perms, strings) = render(json!({
+            "capabilities": { "webview": { "hosts": ["*"], "media": ["microphone"] } }
+        }));
+        let list = perms.as_array().unwrap();
+        let mic = list
+            .iter()
+            .find(|p| p["name"] == "ohos.permission.MICROPHONE")
+            .unwrap();
+        assert_eq!(mic["reason"], "$string:nsh_perm_microphone");
+        assert_eq!(mic["usedScene"]["when"], "inuse");
+        assert_eq!(mic["usedScene"]["abilities"], json!(["EntryAbility"]));
+        assert!(!list.iter().any(|p| p["name"] == "ohos.permission.CAMERA"));
+        assert!(strings.as_array().unwrap().iter().any(|s| {
+            s["name"] == "nsh_perm_microphone"
+                && s["value"] == "The app's web pages use the microphone."
+        }));
+
+        // Both microphone and camera declared, with custom camera reason in `harmonyos.permissions`.
+        let (perms, strings) = render(json!({
+            "capabilities": { "webview": { "hosts": ["*"], "media": ["microphone", "camera"] } },
+            "harmonyos": {
+                "permissions": [
+                    { "name": "CAMERA", "reason": "Video call camera.", "when": "always" }
+                ]
+            }
+        }));
+        let list = perms.as_array().unwrap();
+        let cam = list
+            .iter()
+            .find(|p| p["name"] == "ohos.permission.CAMERA")
+            .unwrap();
+        assert_eq!(cam["reason"], "$string:nsh_perm_camera");
+        assert_eq!(cam["usedScene"]["when"], "always");
+        assert!(
+            strings
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| { s["name"] == "nsh_perm_camera" && s["value"] == "Video call camera." })
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

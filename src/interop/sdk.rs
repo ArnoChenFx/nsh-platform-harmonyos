@@ -569,3 +569,8 @@ pub(crate) fn nsh_web_event(event: WebEvent) -> Result<bool> {
 pub(crate) fn nsh_web_download_allowed(target_id: u32, url: String) -> napi_ohos::Result<bool> {
     crate::media::webview::download_allowed(target_id, &url)
 }
+
+#[napi]
+pub(crate) fn nsh_web_media_allowed(target_id: u32, kind: String) -> napi_ohos::Result<bool> {
+    crate::media::webview::media_allowed(target_id, &kind)
+}

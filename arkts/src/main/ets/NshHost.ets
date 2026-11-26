@@ -187,6 +187,7 @@ interface NshNativeModule {
   nshWebControllerAttached(targetId: number, nativeTag: string): boolean;
   nshWebNavigate(targetId: number, url: string): boolean;
   nshWebDownloadAllowed(targetId: number, url: string): boolean;
+  nshWebMediaAllowed(targetId: number, kind: string): boolean;
   nshWebEvent(event: WebEventPayload): boolean;
 }
 
@@ -469,6 +470,16 @@ class ComponentRuntimeContext implements NshRuntimeContext {
 
   webDownloadAllowed(targetId: number, url: string): boolean {
     return this.isActive() && this.mod.nshWebDownloadAllowed(targetId, url);
+  }
+  webMediaAllowed(targetId: number, kind: string): boolean {
+    if (!this.active) {
+      return false;
+    }
+    try {
+      return this.mod.nshWebMediaAllowed(targetId, kind);
+    } catch {
+      return false;
+    }
   }
   webNavigate(targetId: number, url: string): boolean {
     if (!this.active) {

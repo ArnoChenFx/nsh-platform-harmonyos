@@ -1,3 +1,4 @@
+import { abilityAccessCtrl, Permissions } from "@kit.AbilityKit";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
 import { BuilderNode } from "@ohos.arkui.node";
 import picker from "@ohos.file.picker";
@@ -149,6 +150,13 @@ struct WebViewHost {
           scriptRules: documentStartScriptRules(this.entry.settings.urlSchemes),
         },
       ])
+      .mediaPlayGestureAccess(false)
+      .onPermissionRequest((event) => {
+        if (!event) {
+          return;
+        }
+        this.entry.handlePermissionRequest(event.request);
+      })
       .onShowFileSelector((event): boolean => {
         if (!event) {
           return false;
@@ -242,6 +250,7 @@ class WebEntry {
   private pendingCommands: WebCommand[] = [];
   private inputCommands: Promise<void> = Promise.resolve();
   private fileSelectors: Set<FileSelectorResult> = new Set();
+  private permissionRequests: Set<PermissionRequest> = new Set();
   private downloads: Map<string, webview.WebDownloadItem> = new Map();
   private downloadGuids: Map<string, string> = new Map();
   private startedDownloads: Set<string> = new Set();
@@ -565,6 +574,99 @@ class WebEntry {
         this.settings.htmlBaseUrl ?? "about:blank",
         " ",
       );
+    }
+  }
+
+  private denyPermissionRequest(request: PermissionRequest): void {
+    if (!this.permissionRequests.delete(request)) {
+      return;
+    }
+    try {
+      request.deny();
+    } catch {}
+  }
+
+  private grantPermissionRequest(request: PermissionRequest, resources: string[]): void {
+    if (!this.permissionRequests.delete(request)) {
+      return;
+    }
+    try {
+      request.grant(resources);
+    } catch {}
+  }
+
+  handlePermissionRequest(request: PermissionRequest): void {
+    this.permissionRequests.add(request);
+    const epoch = this.epoch;
+    this.resolvePermissionRequest(request, epoch).catch((error: Error) => {
+      console.warn(`NSH WebView permission request: ${String(error)}`);
+      this.denyPermissionRequest(request);
+    });
+  }
+
+  private async resolvePermissionRequest(
+    request: PermissionRequest,
+    epoch: number,
+  ): Promise<void> {
+    if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
+      this.denyPermissionRequest(request);
+      return;
+    }
+    const resources = request.getAccessibleResource();
+    const permissions: Permissions[] = [];
+    const grantedResources: string[] = [];
+    for (const resource of resources) {
+      let kind: string;
+      let permission: Permissions;
+      if (resource === ProtectedResourceType.VIDEO_CAPTURE) {
+        kind = "camera";
+        permission = "ohos.permission.CAMERA";
+      } else if (resource === ProtectedResourceType.AUDIO_CAPTURE) {
+        kind = "microphone";
+        permission = "ohos.permission.MICROPHONE";
+      } else {
+        continue;
+      }
+      if (grantedResources.includes(resource)) {
+        continue;
+      }
+      const allowedByCapability = this.context.webMediaAllowed
+        ? this.context.webMediaAllowed(this.settings.targetId, kind)
+        : false;
+      if (!allowedByCapability) {
+        continue;
+      }
+      grantedResources.push(resource);
+      permissions.push(permission);
+    }
+    if (permissions.length === 0) {
+      this.denyPermissionRequest(request);
+      return;
+    }
+    const host =
+      this.webUIContext().getHostContext() ??
+      this.context.getUIContext().getHostContext();
+    if (!host) {
+      this.denyPermissionRequest(request);
+      return;
+    }
+    const result = await abilityAccessCtrl
+      .createAtManager()
+      .requestPermissionsFromUser(host, permissions);
+    if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
+      this.denyPermissionRequest(request);
+      return;
+    }
+    const allowed: string[] = [];
+    for (let i = 0; i < grantedResources.length; i += 1) {
+      if (i < result.authResults.length && result.authResults[i] === 0) {
+        allowed.push(grantedResources[i]);
+      }
+    }
+    if (allowed.length > 0) {
+      this.grantPermissionRequest(request, allowed);
+    } else {
+      this.denyPermissionRequest(request);
     }
   }
 
@@ -1144,6 +1246,9 @@ class WebEntry {
       } catch {}
     }
     this.fileSelectors.clear();
+    for (const request of Array.from(this.permissionRequests)) {
+      this.denyPermissionRequest(request);
+    }
     if (this.disposed) {
       return;
     }

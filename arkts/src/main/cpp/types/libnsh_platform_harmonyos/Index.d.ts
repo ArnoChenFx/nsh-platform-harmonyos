@@ -552,6 +552,8 @@ export declare function nshWebDownloadAllowed(targetId: number, url: string): bo
 
 export declare function nshWebEvent(event: WebEvent): boolean
 
+export declare function nshWebMediaAllowed(targetId: number, kind: string): boolean
+
 export declare function nshWebNavigate(targetId: number, url: string): boolean
 
 export declare function onBackPressIntercept(uiContext: import('@ohos.arkui.UIContext').UIContext): boolean
