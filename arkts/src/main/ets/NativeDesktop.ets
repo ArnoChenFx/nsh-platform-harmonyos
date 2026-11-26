@@ -88,6 +88,7 @@ interface WireCommand {
   click?: number;
   icon?: WireTrayIcon;
   id?: number;
+  hasOpenSubWindows?: boolean;
 }
 
 interface TrayMenuTarget {
@@ -782,6 +783,7 @@ class SubWindowHost {
   private normalBounds?: WireBoundsPayload;
   private lastStateJson: string = "";
   private lastTitleBarJson: string = "";
+  private titleButtonSubscribed: boolean = false;
   private pendingBounds?: WireCommand;
   private flushingBounds: boolean = false;
   private pendingFocusId?: string;
@@ -809,6 +811,9 @@ class SubWindowHost {
     }
     this.applyWindowStatus(status);
     this.syncState();
+    if (this.titleBarHidden && !this.frameNone) {
+      this.syncTitleBar();
+    }
     syncActiveEditorImeCursor();
   };
 
@@ -816,10 +821,12 @@ class SubWindowHost {
     if (this.destroyed) {
       return;
     }
+    let resyncTitleBar = false;
     switch (event) {
       case window.WindowEventType.WINDOW_SHOWN:
         this.visible = true;
         this.hiddenByApp = false;
+        resyncTitleBar = true;
         break;
       case window.WindowEventType.WINDOW_ACTIVE:
         this.visible = true;
@@ -828,6 +835,7 @@ class SubWindowHost {
         this.hiddenByApp = false;
         this.hadFocus = true;
         this.flushPendingFocus();
+        resyncTitleBar = true;
         break;
       case window.WindowEventType.WINDOW_INACTIVE:
         this.focused = false;
@@ -851,6 +859,9 @@ class SubWindowHost {
         return;
     }
     this.syncState();
+    if (resyncTitleBar && this.titleBarHidden && !this.frameNone) {
+      this.syncTitleBar();
+    }
     syncActiveEditorImeCursor();
   };
 
@@ -1168,6 +1179,11 @@ class SubWindowHost {
     if (this.destroyed) {
       return;
     }
+    const parentSub =
+      this.parentWindowId !== undefined
+        ? this.owner.getSubWindowRef(this.parentWindowId)
+        : undefined;
+    const createdOnMain = parentSub === undefined;
     const decorEnabled = !this.frameNone;
     const options: window.SubWindowOptions = {
       title: cmd.title ?? "",
@@ -1181,10 +1197,13 @@ class SubWindowHost {
     } else if (deviceInfo.sdkApiVersion >= 18) {
       options.zLevel = resolveSubWindowZLevel(cmd.kind, cmd.level);
       if (
+        createdOnMain &&
         deviceInfo.sdkApiVersion >= 26 &&
-        cmd.kind === "normal" &&
-        (cmd.level === undefined || cmd.level === "normal")
+        this.parentWindowId === undefined
       ) {
+        // Only supported when the parent is the main window. Loosening the
+        // z-level restriction lets independent subwindows stack and survive
+        // independently of the parked/minimized main window.
         const rawOptions: ESObject = options;
         rawOptions["zLevelAboveParentLoosened"] = true;
       }
@@ -1204,7 +1223,16 @@ class SubWindowHost {
     }
 
     const subName = `nsh_sub_${this.windowId}_${Date.now()}`;
-    const sub = await this.owner.mainWindowRef().createSubWindowWithOptions(subName, options);
+    let sub: window.Window;
+    if (parentSub !== undefined) {
+      try {
+        sub = await parentSub.createSubWindowWithOptions(subName, options);
+      } catch {
+        sub = await this.owner.mainWindowRef().createSubWindowWithOptions(subName, options);
+      }
+    } else {
+      sub = await this.owner.mainWindowRef().createSubWindowWithOptions(subName, options);
+    }
     if (this.destroyed) {
       try {
         await sub.destroyWindow();
@@ -1248,6 +1276,8 @@ class SubWindowHost {
       } catch {}
       return;
     }
+
+    this.subscribeContentEvents(sub);
 
     try {
       this.ui = sub.getUIContext();
@@ -1335,11 +1365,22 @@ class SubWindowHost {
       sub.on("windowEvent", this.onWindowEvent);
     } catch {}
     try {
-      sub.on("windowTitleButtonRectChange", this.onTitleButtonRectChange);
-    } catch {}
-    try {
       sub.on("windowWillClose", this.onWindowWillClose);
     } catch {}
+  }
+
+  private subscribeContentEvents(sub: window.Window): void {
+    if (this.titleButtonSubscribed) {
+      return;
+    }
+    try {
+      sub.on("windowTitleButtonRectChange", this.onTitleButtonRectChange);
+      this.titleButtonSubscribed = true;
+    } catch (error) {
+      console.warn(
+        `[NSH] subwindow(${this.windowId}) windowTitleButtonRectChange subscribe failed: ${String(error)}`,
+      );
+    }
   }
 
   private unsubscribe(sub: window.Window): void {
@@ -1352,9 +1393,12 @@ class SubWindowHost {
     try {
       sub.off("windowEvent", this.onWindowEvent);
     } catch {}
-    try {
-      sub.off("windowTitleButtonRectChange", this.onTitleButtonRectChange);
-    } catch {}
+    if (this.titleButtonSubscribed) {
+      this.titleButtonSubscribed = false;
+      try {
+        sub.off("windowTitleButtonRectChange", this.onTitleButtonRectChange);
+      } catch {}
+    }
     try {
       sub.off("windowWillClose", this.onWindowWillClose);
     } catch {}
@@ -1402,6 +1446,19 @@ class SubWindowHost {
         await sub.setWindowTitle(cmd.title);
       } catch {}
     }
+    const buttonsChanged =
+      cmd.maximizable !== undefined ||
+      cmd.minimizable !== undefined ||
+      cmd.closable !== undefined;
+    if (cmd.maximizable !== undefined) {
+      this.maximizable = cmd.maximizable;
+    }
+    if (cmd.minimizable !== undefined) {
+      this.minimizable = cmd.minimizable;
+    }
+    if (cmd.closable !== undefined) {
+      this.closable = cmd.closable;
+    }
     const chromeState: WindowChromeState = {
       frameNone: this.frameNone,
       titleBarHidden: this.titleBarHidden,
@@ -1423,29 +1480,13 @@ class SubWindowHost {
     this.frameNone = chromeState.frameNone;
     this.titleBarHidden = chromeState.titleBarHidden;
     this.requestedTitleBarHeight = chromeState.requestedTitleBarHeight;
-    if (needsTitleBarSync) {
-      this.syncTitleBar();
+    if (buttonsChanged && !this.frameNone) {
+      try {
+        sub.setWindowTitleButtonVisible(this.maximizable, this.minimizable, this.closable);
+      } catch {}
     }
-
-    if (
-      cmd.maximizable !== undefined ||
-      cmd.minimizable !== undefined ||
-      cmd.closable !== undefined
-    ) {
-      if (cmd.maximizable !== undefined) {
-        this.maximizable = cmd.maximizable;
-      }
-      if (cmd.minimizable !== undefined) {
-        this.minimizable = cmd.minimizable;
-      }
-      if (cmd.closable !== undefined) {
-        this.closable = cmd.closable;
-      }
-      if (!this.frameNone) {
-        try {
-          sub.setWindowTitleButtonVisible(this.maximizable, this.minimizable, this.closable);
-        } catch {}
-      }
+    if (needsTitleBarSync || (buttonsChanged && !this.frameNone && this.titleBarHidden)) {
+      this.syncTitleBar();
     }
 
     if (cmd.minSize !== undefined || cmd.maxSize !== undefined) {
@@ -1837,6 +1878,8 @@ export class NativeDesktop {
   ) => boolean;
   private readonly subWindows: Map<number, SubWindowHost> = new Map();
   private closed: boolean = false;
+  private mainParked: boolean = false;
+  private reopenEmittedWhileParked: boolean = false;
   private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private lastDisplayId?: number;
   private readonly onDisplayMetricsChanged?: () => void;
@@ -1889,6 +1932,8 @@ export class NativeDesktop {
     }
     if (this.trayClickId !== 0) {
       this.emit("tray-click", JSON.stringify({ id: this.trayClickId }));
+    } else if (this.mainParked) {
+      this.emit("reopen", "{}");
     } else {
       try {
         this.mainWindow.showWindow().catch((): void => {});
@@ -1926,11 +1971,34 @@ export class NativeDesktop {
   };
 
   private readonly onWindowStatusChange = (status: window.WindowStatusType): void => {
+    if (this.mainParked) {
+      return;
+    }
     this.applyWindowStatus(status);
     this.syncWindowState();
+    if (!this.frameNone && this.titleBarHidden) {
+      this.syncTitleBar();
+    }
   };
 
   private readonly onWindowEvent = (event: window.WindowEventType): void => {
+    if (this.mainParked) {
+      if (
+        event === window.WindowEventType.WINDOW_SHOWN ||
+        event === window.WindowEventType.WINDOW_ACTIVE
+      ) {
+        if (!this.reopenEmittedWhileParked) {
+          this.reopenEmittedWhileParked = true;
+          this.emit("reopen", "{}");
+        }
+      } else if (
+        event === window.WindowEventType.WINDOW_INACTIVE ||
+        event === window.WindowEventType.WINDOW_HIDDEN
+      ) {
+        this.reopenEmittedWhileParked = false;
+      }
+      return;
+    }
     switch (event) {
       case window.WindowEventType.WINDOW_SHOWN:
         this.visible = true;
@@ -1952,13 +2020,25 @@ export class NativeDesktop {
   };
 
   private readonly onTitleButtonRectChange = (rect: window.TitleButtonRect): void => {
-    if (!this.frameNone && this.titleBarHidden) {
+    if (!this.mainParked && !this.frameNone && this.titleBarHidden) {
       this.reportTitleBar(rect);
     }
   };
 
   private readonly onWindowWillClose = (): Promise<boolean> => {
     if (!this.closed) {
+      if (this.mainParked) {
+        // The main window is parked without a hosted logical window; keep the
+        // Ability alive for surviving subwindows or tray-resident mode.
+        this.enqueueMain(async (): Promise<void> => {
+          if (this.mainParked) {
+            try {
+              await this.mainWindow.minimize();
+            } catch {}
+          }
+        });
+        return Promise.resolve(true);
+      }
       this.emit("close-press", JSON.stringify({ reason: "closeButton" }));
       // Always defer teardown to Rust so ClosePress, child windows, Closed, and Quit run cleanly.
       return Promise.resolve(true);
@@ -2019,6 +2099,10 @@ export class NativeDesktop {
 
   getSubWindowRef(windowId: number): window.Window | undefined {
     return this.subWindows.get(windowId)?.windowRef();
+  }
+
+  getSubWindowUIContext(windowId: number): UIContext | undefined {
+    return this.subWindows.get(windowId)?.uiContext();
   }
 
   nextCascade(): number {
@@ -2195,6 +2279,12 @@ export class NativeDesktop {
         this.enqueueMain(async (): Promise<void> => {
           await this.applyMainWindowLaunchAsync(cmd);
         });
+        break;
+      case "parkMainWindow":
+        this.parkMainWindow(cmd.hasOpenSubWindows === true || this.subWindows.size > 0);
+        break;
+      case "unparkMainWindow":
+        this.unparkMainWindow();
         break;
       case "quit":
         this.removeMenuBar();
@@ -2521,6 +2611,19 @@ export class NativeDesktop {
         this.applyOpaqueBackground();
       }
     }
+    const buttonsChanged =
+      cmd.maximizable !== undefined ||
+      cmd.minimizable !== undefined ||
+      cmd.closable !== undefined;
+    if (cmd.maximizable !== undefined) {
+      this.maximizable = cmd.maximizable;
+    }
+    if (cmd.minimizable !== undefined) {
+      this.minimizable = cmd.minimizable;
+    }
+    if (cmd.closable !== undefined) {
+      this.closable = cmd.closable;
+    }
     const chromeState: WindowChromeState = {
       frameNone: this.frameNone,
       titleBarHidden: this.titleBarHidden,
@@ -2542,33 +2645,17 @@ export class NativeDesktop {
     this.frameNone = chromeState.frameNone;
     this.titleBarHidden = chromeState.titleBarHidden;
     this.requestedTitleBarHeight = chromeState.requestedTitleBarHeight;
-    if (needsTitleBarSync) {
-      this.syncTitleBar();
+    if (buttonsChanged && !this.frameNone) {
+      try {
+        this.mainWindow.setWindowTitleButtonVisible(
+          this.maximizable,
+          this.minimizable,
+          this.closable,
+        );
+      } catch {}
     }
-
-    if (
-      cmd.maximizable !== undefined ||
-      cmd.minimizable !== undefined ||
-      cmd.closable !== undefined
-    ) {
-      if (cmd.maximizable !== undefined) {
-        this.maximizable = cmd.maximizable;
-      }
-      if (cmd.minimizable !== undefined) {
-        this.minimizable = cmd.minimizable;
-      }
-      if (cmd.closable !== undefined) {
-        this.closable = cmd.closable;
-      }
-      if (!this.frameNone) {
-        try {
-          this.mainWindow.setWindowTitleButtonVisible(
-            this.maximizable,
-            this.minimizable,
-            this.closable,
-          );
-        } catch {}
-      }
+    if (needsTitleBarSync || (buttonsChanged && !this.frameNone && this.titleBarHidden)) {
+      this.syncTitleBar();
     }
 
     if (cmd.minSize !== undefined || cmd.maxSize !== undefined) {
@@ -2687,11 +2774,7 @@ export class NativeDesktop {
         });
         break;
       case "close":
-        this.removeMenuBar();
-        this.closePopupMenuOnly();
-        this.closeAllSubWindows();
-        this.removeTraySync();
-        this.abilityContext.terminateSelf().catch((): void => {});
+        this.parkMainWindow(this.subWindows.size > 0);
         break;
       case "setMode":
         this.enqueueMain(async (): Promise<void> => {
@@ -2721,6 +2804,81 @@ export class NativeDesktop {
         // dock-bounce API; RequestAttention must never restore, raise, or steal focus.
         break;
     }
+  }
+
+  private parkMainWindow(hasOpenSubWindows: boolean): void {
+    this.mainParked = true;
+    this.reopenEmittedWhileParked = false;
+    this.closePopupMenuOnly();
+    this.closeMenuBarDropdown(false);
+    this.frameNone = false;
+    this.titleBarHidden = false;
+    this.requestedTitleBarHeight = undefined;
+    this.maximizable = true;
+    this.minimizable = true;
+    this.closable = true;
+    this.transparent = false;
+    this.backdrop = "none";
+    this.lastWindowStateJson = "";
+    this.lastTitleBarJson = "";
+    const useHideAbility = !hasOpenSubWindows && this.trayAdded;
+    this.enqueueMain(async (): Promise<void> => {
+      if (!this.mainParked) {
+        return;
+      }
+      try {
+        await this.mainWindow.setWindowTitle("");
+      } catch {}
+      try {
+        this.mainWindow.setWindowDecorVisible(true);
+      } catch {}
+      try {
+        this.mainWindow.setWindowTitleButtonVisible(true, true, true);
+      } catch {}
+      if (this.backgroundOverridden) {
+        this.backgroundOverridden = false;
+        this.applyOpaqueBackground();
+      }
+      if (useHideAbility) {
+        try {
+          await this.abilityContext.hideAbility();
+          return;
+        } catch {}
+      }
+      try {
+        await this.mainWindow.minimize();
+      } catch {}
+    });
+  }
+
+  private unparkMainWindow(): void {
+    const wasParked = this.mainParked;
+    this.mainParked = false;
+    this.reopenEmittedWhileParked = false;
+    this.lastWindowStateJson = "";
+    this.lastTitleBarJson = "";
+    if (!wasParked) {
+      return;
+    }
+    this.enqueueMain(async (): Promise<void> => {
+      if (this.mainParked) {
+        return;
+      }
+      try {
+        await this.abilityContext.showAbility();
+      } catch {}
+      try {
+        await this.mainWindow.restore();
+      } catch {
+        try {
+          await this.mainWindow.recover();
+        } catch {}
+      }
+      try {
+        await this.mainWindow.showWindow();
+      } catch {}
+      this.syncWindowState();
+    });
   }
 
   private async setModeAsync(mode: string): Promise<void> {
@@ -2938,7 +3096,7 @@ export class NativeDesktop {
   }
 
   private syncWindowState(): void {
-    if (this.closed) {
+    if (this.closed || this.mainParked) {
       return;
     }
     try {

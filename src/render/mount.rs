@@ -104,6 +104,11 @@ pub(crate) struct UiContext {
         std::cell::RefCell<Option<Rc<crate::render::composition::worker::Worker>>>,
     pub(crate) composite_nodes: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) key_focus: std::cell::RefCell<std::rc::Weak<Node>>,
+    pub(crate) nodes_index: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, std::rc::Weak<Node>>>,
+    pub(crate) modals_index:
+        std::cell::RefCell<Vec<std::rc::Weak<crate::navigation::modal::Modal>>>,
+    pub(crate) axis_routers:
+        std::cell::RefCell<rustc_hash::FxHashMap<NodeId, crate::input::wheel::AxisRouter>>,
     pub(crate) selected_text: std::cell::RefCell<Option<std::rc::Weak<Node>>>,
     pub(crate) accessibility_dirty: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) accessibility_focus: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
@@ -133,8 +138,57 @@ pub(crate) struct UiContext {
     pub(crate) fonts: Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
+    pub(crate) text_locale: std::cell::Cell<Option<nsh_core::platform::Locale>>,
     pub(crate) main_window: std::cell::RefCell<crate::services::desktop::MainWindowState>,
     pub(crate) appearance: std::cell::Cell<nsh_core::platform::Appearance>,
+}
+
+impl UiContext {
+    pub(crate) fn spoken_locale(&self) -> nsh_core::platform::Locale {
+        self.text_locale
+            .get()
+            .unwrap_or_else(|| self.platform.get().locale)
+    }
+
+    pub(crate) fn clear_axis_router(&self, surface_id: NodeId) {
+        if let Some(router) = self.axis_routers.borrow_mut().get_mut(&surface_id) {
+            router.clear();
+        }
+    }
+
+    pub(crate) fn node_by_id(&self, id: NodeId) -> Option<Rc<Node>> {
+        self.nodes_index
+            .borrow()
+            .get(&id)
+            .and_then(std::rc::Weak::upgrade)
+            .filter(|node| node.active.get() && !node.pending_delete.get())
+    }
+
+    /// Returns the newest visible non-closing overlay modal that covers
+    /// `window` (forming its active focus scope), if any.
+    pub(crate) fn focus_scope_modal(&self, window: NodeId) -> Option<Rc<Node>> {
+        let modals = self.modals_index.borrow();
+        modals
+            .iter()
+            .rev()
+            .filter_map(std::rc::Weak::upgrade)
+            .find_map(|modal| {
+                if !modal.is_visible()
+                    || modal.closing()
+                    || modal.is_desktop_window()
+                    || modal.is_main_window_host()
+                {
+                    return None;
+                }
+                let node = modal.node_id().and_then(|id| self.node_by_id(id))?;
+                let belongs = if window == nsh_core::ROOT_ID {
+                    !modal.is_sub_window_modal()
+                } else {
+                    modal.host_sub_window_id() == Some(window)
+                };
+                belongs.then_some(node)
+            })
+    }
 }
 
 struct BatchGuard(Rc<UiContext>, bool);
@@ -268,6 +322,12 @@ impl Mounter {
         let reduce_motion_changed = self.platform.get().reduce_motion != environment.reduce_motion;
         let was_background = self.platform.get().lifecycle == nsh_engine::Lifecycle::Background;
         self.platform.set(environment);
+        if environment
+            .window_state
+            .is_some_and(|state| state.visible && state.focused)
+        {
+            self.desktop.main_window_activated.set(true);
+        }
         let mut result = Ok(());
         for node in self.nodes.values() {
             if density_changed {
@@ -276,7 +336,10 @@ impl Mounter {
             if let Some(screen) = node.screen.borrow().as_ref() {
                 result = result.and(screen.update_environment());
             }
-            if let Some(modal) = node.modal.borrow().as_ref() {
+            if let Some(modal) = node.modal.borrow().as_ref()
+                && !modal.is_desktop_window()
+                && (!modal.is_sub_window_modal() || density_changed)
+            {
                 modal.refresh_metrics();
                 result = result.and(
                     node.mounted()
@@ -480,24 +543,46 @@ impl Mounter {
     fn route_back(&self, app_listener: bool) -> Result<()> {
         use nsh_core::navigation::{Back, back_target};
         let desktop = self.platform.get().os.is_desktop();
-        let modal = self
-            .modals
-            .iter()
-            .rev()
-            .filter_map(std::rc::Weak::upgrade)
-            .find(|modal| modal.is_desktop_focused())
-            .or_else(|| {
+        let modal = if desktop {
+            if let Some(focused_sub) = self
+                .modals
+                .iter()
+                .rev()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|modal| modal.is_desktop_focused())
+            {
+                let sub_id = focused_sub.node_id();
                 self.modals
                     .iter()
                     .rev()
                     .filter_map(std::rc::Weak::upgrade)
                     .find(|modal| {
                         modal.is_visible()
-                            && (!desktop
-                                || (!modal.is_desktop_window() && !modal.is_main_window_host())
+                            && !modal.is_desktop_window()
+                            && !modal.is_main_window_host()
+                            && modal.host_sub_window_id() == sub_id
+                    })
+                    .or(Some(focused_sub))
+            } else {
+                self.modals
+                    .iter()
+                    .rev()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .find(|modal| {
+                        modal.is_visible()
+                            && ((!modal.is_desktop_window()
+                                && !modal.is_main_window_host()
+                                && !modal.is_sub_window_modal())
                                 || modal.is_desktop_modal())
                     })
-            });
+            }
+        } else {
+            self.modals
+                .iter()
+                .rev()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|modal| modal.is_visible())
+        };
         let target = back_target(
             modal.as_ref().and_then(|modal| modal.node_id()),
             app_listener
@@ -594,6 +679,32 @@ impl Mounter {
                     modal.cancel_pending_present();
                     continue;
                 }
+                if !modal.is_desktop_window() && !modal.is_main_window_host() {
+                    let win_id = modal.config_window();
+                    if win_id != nsh_core::ROOT_ID {
+                        if self.desktop.hosted_main_window == Some(win_id) {
+                            // Modal targets the hosted main window; allow native dialog presentation.
+                        } else if let Some(host) = self
+                            .nodes
+                            .get(&win_id)
+                            .and_then(|win| win.modal.borrow().clone())
+                            .filter(|host| host.is_desktop_window() && host.is_visible())
+                        {
+                            if !modal.is_sub_window_modal() {
+                                modal.set_host_sub_window(Some(host));
+                            }
+                        } else {
+                            // Target secondary window is already closed or gone; never
+                            // leak its modal onto the main window.
+                            modal.cancel_pending_present();
+                            continue;
+                        }
+                    }
+                    if !self.modal_has_live_ancestor(&modal) {
+                        modal.cancel_pending_present();
+                        continue;
+                    }
+                }
                 modal.present_if_pending()?;
             }
             Ok(())
@@ -601,6 +712,33 @@ impl Mounter {
         // Capture releases deferred by a batch still need synchronization if
         // a preceding host, stack or modal update failed.
         result.and(self.reconcile_navigation_capture())
+    }
+    fn modal_has_live_ancestor(&self, modal: &crate::navigation::modal::Modal) -> bool {
+        let Some(owner) = modal.owner_node() else {
+            return false;
+        };
+        if owner.pending_delete.get() {
+            return false;
+        }
+        let mut cursor = owner.parent_node.borrow().upgrade();
+        for _ in 0..1024 {
+            let Some(node) = cursor else {
+                return false;
+            };
+            if node.pending_delete.get() {
+                return false;
+            }
+            if let Some(parent_modal) = node.modal.borrow().as_ref()
+                && parent_modal.is_desktop_window()
+            {
+                return parent_modal.is_visible();
+            }
+            if node.id == nsh_core::ROOT_ID {
+                return true;
+            }
+            cursor = node.parent_node.borrow().upgrade();
+        }
+        false
     }
     fn reconcile_navigation_capture(&self) -> Result<()> {
         let res = self
@@ -614,6 +752,56 @@ impl Mounter {
             }
         }
         res
+    }
+    fn node_has_visual_paint(node: &Node) -> bool {
+        let style = node.style.borrow();
+        Node::style_has_box_paint(&style)
+            || style.effects.is_some()
+            || style.elevation.0 > 0.0
+            || style.glass_effect != nsh_core::GlassEffect::None
+            || !node.shader_layers.borrow().is_empty()
+            || node.backdrop_layer.get().is_some()
+    }
+    fn is_transparent_host_view(node: &Node) -> bool {
+        node.modal.borrow().is_none()
+            && node.kind == ViewKind::View
+            && node.component.borrow().is_none()
+            && !Self::node_has_visual_paint(node)
+    }
+    fn subtree_has_non_modal_content(node: &Rc<Node>) -> bool {
+        if node.modal.borrow().is_some() {
+            return false;
+        }
+        if !Self::is_transparent_host_view(node) {
+            return true;
+        }
+        node.children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|child| Self::subtree_has_non_modal_content(&child))
+    }
+    fn has_only_transparent_root_ancestors(&self, node: &Node) -> bool {
+        let mut current = node.parent.get();
+        while let Some(parent_id) = current {
+            if parent_id == nsh_core::ROOT_ID {
+                return true;
+            }
+            let Ok(parent) = self.node(parent_id) else {
+                return false;
+            };
+            if !Self::is_transparent_host_view(parent) {
+                return false;
+            }
+            current = parent.parent.get();
+        }
+        false
+    }
+    fn set_hosted_main_window(&mut self, id: Option<NodeId>) {
+        self.desktop.hosted_main_window = id;
+        if let Some(route) = self.dispatcher.upgrade() {
+            route.keyboard.lock().unwrap().hosted_main_window = id;
+        }
     }
     fn is_unopened_window_container(&self, modal: &crate::navigation::modal::Modal) -> bool {
         if !self.platform.get().os.is_desktop()
@@ -629,7 +817,7 @@ impl Mounter {
         let Ok(node) = self.node(id) else {
             return false;
         };
-        node.parent.get() == Some(nsh_core::ROOT_ID)
+        self.has_only_transparent_root_ancestors(node)
             && node
                 .children
                 .borrow()
@@ -645,12 +833,15 @@ impl Mounter {
             .borrow()
             .iter()
             .filter_map(std::rc::Weak::upgrade)
-            .any(|child| child.modal.borrow().is_none())
+            .any(|child| Self::subtree_has_non_modal_content(&child))
     }
     pub(crate) fn note_main_window_launch_applied(&mut self) {
         self.desktop.main_window_launch_applied = true;
     }
     pub(crate) fn on_main_window_state(&self, state: nsh_core::desktop::WindowState) {
+        if state.visible && state.focused {
+            self.desktop.main_window_activated.set(true);
+        }
         if let Some(id) = self.desktop.hosted_main_window {
             self.control.dispatch_event(
                 id,
@@ -700,21 +891,79 @@ impl Mounter {
         }
         Ok(())
     }
+    fn has_open_sub_windows(&self) -> bool {
+        self.modals
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|m| m.is_desktop_window() && m.is_visible())
+    }
+    fn close_hosted_main_window(
+        &mut self,
+        id: NodeId,
+        emit_cause: Option<nsh_core::desktop::WindowCloseCause>,
+    ) -> Result<()> {
+        if self.desktop.hosted_main_window != Some(id) {
+            return Ok(());
+        }
+        self.close_desktop_children(id)?;
+        self.set_hosted_main_window(None);
+        self.desktop.close_on_press = true;
+        self.desktop.menu_bar_alt_shown = false;
+        if let Ok(node) = self.node(id)
+            && let Some(modal) = node.modal.borrow().clone()
+        {
+            modal.close(false)?;
+        }
+        if let Some(cause) = emit_cause {
+            self.control.dispatch_event(
+                id,
+                nsh_core::EventKind::Window,
+                nsh_core::EventPayload::Window(Box::new(nsh_core::desktop::WindowEvent::Closed {
+                    cause,
+                })),
+            );
+        }
+        self.desktop.pending_park_main = true;
+        if !self.flushing_batch.get() {
+            self.flush_pending_main_park()?;
+        }
+        Ok(())
+    }
+    fn flush_pending_main_park(&mut self) -> Result<()> {
+        if !std::mem::replace(&mut self.desktop.pending_park_main, false) {
+            return Ok(());
+        }
+        if self.desktop.hosted_main_window.is_some() {
+            return Ok(());
+        }
+        self.desktop.main_window_parked = true;
+        self.host
+            .desktop_command(&crate::services::desktop::WireCommand::ParkMainWindow {
+                has_open_sub_windows: self.has_open_sub_windows(),
+            })?;
+        Ok(())
+    }
     fn open_hosted_main_window(
         &mut self,
         id: NodeId,
         modal: &crate::navigation::modal::Modal,
         open: nsh_core::desktop::OpenWindow,
     ) -> Result<()> {
+        self.desktop.pending_park_main = false;
         let root = self.node(nsh_core::ROOT_ID)?.clone();
         modal.open_in_main_window(&root)?;
-        self.desktop.hosted_main_window = Some(id);
+        self.set_hosted_main_window(Some(id));
+        self.desktop.close_on_press = open.options.attributes.close_on_press.unwrap_or(true);
         self.apply_main_window_attributes(&open.options.attributes)?;
         if (!self.desktop.main_window_launch_applied || !open.implicit)
             && let Some(launch) = crate::services::desktop::wire_open_main_window_launch(&open)
         {
             self.desktop.main_window_launch_applied = true;
             self.host.desktop_command(&launch)?;
+        }
+        if std::mem::replace(&mut self.desktop.main_window_parked, false) {
+            self.host
+                .desktop_command(&crate::services::desktop::WireCommand::UnparkMainWindow)?;
         }
         if let Some(state) = self.platform.get().window_state {
             self.on_main_window_state(state);
@@ -746,15 +995,10 @@ impl Mounter {
                     }
                     DesktopCommand::Request(request) => {
                         if matches!(request, nsh_core::desktop::WindowRequest::Close) {
-                            self.close_desktop_children(id)?;
-                            self.close_desktop_children(nsh_core::ROOT_ID)?;
-                            self.desktop.hosted_main_window = None;
-                            if let Ok(node) = self.node(id)
-                                && let Some(modal) = node.modal.borrow().clone()
-                            {
-                                modal.close(false)?;
-                            }
-                            self.host.desktop_command(&wire_request(&request))?;
+                            self.close_hosted_main_window(
+                                id,
+                                Some(nsh_core::desktop::WindowCloseCause::Close),
+                            )?;
                         } else {
                             self.host.desktop_command(&wire_request(&request))?;
                         }
@@ -800,7 +1044,7 @@ impl Mounter {
                     let modal = node.modal.borrow().clone();
                     if let Some(modal) = modal {
                         match other {
-                            DesktopCommand::OpenWindow(mut open) => {
+                            DesktopCommand::OpenWindow(open) => {
                                 let should_host_in_main = self.desktop.hosted_main_window.is_none()
                                     && (open.implicit
                                         || (open.parent.is_none()
@@ -811,16 +1055,24 @@ impl Mounter {
                                 if should_host_in_main {
                                     self.open_hosted_main_window(id, &modal, *open)?;
                                 } else {
-                                    if open.parent == self.desktop.hosted_main_window {
-                                        open.parent = Some(nsh_core::ROOT_ID);
-                                    }
-                                    modal.open_desktop_window(*open)?;
+                                    let parent_is_main = open.parent.is_some()
+                                        && (open.parent == self.desktop.hosted_main_window
+                                            || open.parent == Some(nsh_core::ROOT_ID));
+                                    modal.open_desktop_window(*open, parent_is_main)?;
                                 }
                             }
                             DesktopCommand::SetAttributes(attrs) => {
                                 modal.set_desktop_attributes(*attrs)?;
                             }
-                            DesktopCommand::Request(req) => modal.desktop_request(req)?,
+                            DesktopCommand::Request(req) => {
+                                let is_close =
+                                    matches!(req, nsh_core::desktop::WindowRequest::Close);
+                                modal.desktop_request(req)?;
+                                if is_close {
+                                    self.cursor.clear_window(id);
+                                    self.close_desktop_children(id)?;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -835,13 +1087,35 @@ impl Mounter {
             DesktopCommand::Request(request) => {
                 if matches!(request, nsh_core::desktop::WindowRequest::Close) {
                     self.close_desktop_children(nsh_core::ROOT_ID)?;
+                    self.control.dispatch_event(
+                        nsh_core::ROOT_ID,
+                        nsh_core::EventKind::Window,
+                        nsh_core::EventPayload::Window(Box::new(
+                            nsh_core::desktop::WindowEvent::Closed {
+                                cause: nsh_core::desktop::WindowCloseCause::Close,
+                            },
+                        )),
+                    );
+                    if self.has_open_sub_windows() {
+                        self.desktop.main_window_parked = true;
+                        self.host.desktop_command(&WireCommand::ParkMainWindow {
+                            has_open_sub_windows: true,
+                        })?;
+                    } else {
+                        self.host.desktop_command(&wire_request(&request))?;
+                    }
+                } else {
+                    self.host.desktop_command(&wire_request(&request))?;
                 }
-                self.host.desktop_command(&wire_request(&request))?;
             }
             DesktopCommand::Quit => {
+                self.desktop.pending_park_main = false;
+                self.desktop.main_window_parked = false;
                 self.host.desktop_command(&WireCommand::Quit)?;
             }
             DesktopCommand::Restart => {
+                self.desktop.pending_park_main = false;
+                self.desktop.main_window_parked = false;
                 self.host.desktop_command(&WireCommand::Restart)?;
             }
             DesktopCommand::SetQuitOnRequest(quit) => {
@@ -1135,17 +1409,12 @@ impl Mounter {
                         EventPayload::Window(Box::new(WindowEvent::ClosePress { reason })),
                     );
                     if self.desktop.close_on_press {
-                        self.close_desktop_children(window_id)?;
-                        self.close_desktop_children(nsh_core::ROOT_ID)?;
-                        self.control.dispatch_event(
+                        self.close_hosted_main_window(
                             window_id,
-                            EventKind::Window,
-                            EventPayload::Window(Box::new(WindowEvent::Closed {
-                                cause: WindowCloseCause::ClosePress,
-                            })),
-                        );
+                            Some(WindowCloseCause::ClosePress),
+                        )?;
                     }
-                } else {
+                } else if !self.desktop.main_window_parked {
                     self.control.dispatch_event(
                         nsh_core::ROOT_ID,
                         EventKind::Window,
@@ -1160,7 +1429,14 @@ impl Mounter {
                                 cause: WindowCloseCause::ClosePress,
                             })),
                         );
-                        self.host.desktop_command(&WireCommand::Quit)?;
+                        if self.has_open_sub_windows() {
+                            self.desktop.main_window_parked = true;
+                            self.host.desktop_command(&WireCommand::ParkMainWindow {
+                                has_open_sub_windows: true,
+                            })?;
+                        } else {
+                            self.host.desktop_command(&WireCommand::Quit)?;
+                        }
                     }
                 }
             }
@@ -1240,7 +1516,10 @@ impl Mounter {
                 if let Ok(node) = self.node(window_id)
                     && let Some(modal) = node.modal.borrow().clone()
                 {
-                    modal.on_sub_window_state(state)?;
+                    let became_focused = modal.on_sub_window_state(state)?;
+                    if became_focused {
+                        self.request_desktop_focus_for(window_id);
+                    }
                 }
             }
             DesktopEvent::SubWindowTitleBar { window_id, edges } => {
@@ -1430,7 +1709,7 @@ impl Mounter {
                         if let Ok(window) = self.node(target.key_window_id())
                             && let Some(sink) = window.focus_sink.borrow().as_ref()
                         {
-                            let _ = sink.borrow().request_focus();
+                            let _ = crate::input::keyboard::request_node_focus(&sink.borrow());
                         }
                         target.selection_select_all_target(true)?;
                         return Ok(());
@@ -1472,6 +1751,8 @@ impl Mounter {
                                     self.dispatcher.clone(),
                                     input_id,
                                     input.report_paste(),
+                                    input.paste_max_size(),
+                                    input.paste_edit_gen(),
                                 )?;
                                 return Ok(());
                             }
@@ -1514,6 +1795,29 @@ impl Mounter {
         self.request_desktop_focus_for(nsh_core::ROOT_ID);
     }
     pub(crate) fn request_desktop_focus_for(&self, window_id: NodeId) {
+        let active_sub_modal = (window_id != nsh_core::ROOT_ID)
+            .then(|| {
+                self.modals
+                    .iter()
+                    .rev()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .find(|modal| {
+                        modal.is_visible()
+                            && !modal.closing()
+                            && !modal.is_desktop_window()
+                            && !modal.is_main_window_host()
+                            && modal.host_sub_window_id() == Some(window_id)
+                    })
+                    .and_then(|modal| modal.owner_node())
+            })
+            .flatten();
+        let in_scope = |node: &Node| {
+            node.visible_in_tree()
+                && node.key_window_id() == window_id
+                && active_sub_modal
+                    .as_ref()
+                    .is_none_or(|modal| node.is_descendant_of(modal.id))
+        };
         let mut stale_other_window_focus = false;
         let has_input_focus = self
             .dispatcher
@@ -1521,8 +1825,7 @@ impl Mounter {
             .and_then(|route| route.keyboard.lock().unwrap().focused)
             .is_some_and(|focused_id| {
                 if let Ok(node) = self.node(focused_id)
-                    && node.visible_in_tree()
-                    && node.key_window_id() == window_id
+                    && in_scope(node)
                 {
                     true
                 } else {
@@ -1534,7 +1837,7 @@ impl Mounter {
             .key_focus
             .borrow()
             .upgrade()
-            .is_some_and(|node| node.visible_in_tree() && node.key_window_id() == window_id);
+            .is_some_and(|node| in_scope(&node));
         if has_input_focus || has_child_focus {
             return;
         }
@@ -1544,11 +1847,12 @@ impl Mounter {
             keyboard.input = None;
             keyboard.composing = false;
         }
-        if let Ok(window) = self.node(window_id) {
-            if let Some(sink) = window.focus_sink.borrow().as_ref() {
-                let _ = sink.borrow().request_focus();
+        let target = active_sub_modal.or_else(|| self.node(window_id).ok().cloned());
+        if let Some(target) = target {
+            if let Some(sink) = target.focus_sink.borrow().as_ref() {
+                let _ = crate::input::keyboard::request_node_focus(&sink.borrow());
             } else {
-                let _ = window.native.borrow().request_focus();
+                let _ = crate::input::keyboard::request_node_focus(&target.native.borrow());
             }
         }
     }
@@ -1757,7 +2061,7 @@ impl Mounter {
 
     fn unlink(&mut self, id: NodeId, retain: bool) -> Result<()> {
         if self.desktop.hosted_main_window == Some(id) {
-            self.desktop.hosted_main_window = None;
+            self.close_hosted_main_window(id, None)?;
         }
         let node = self.node(id)?;
         let parent = node.parent.get().map(|id| self.node(id)).transpose()?;
@@ -1817,8 +2121,15 @@ impl Mounter {
                 parent.accessibility_state.changed(parent);
             }
         }
+        let keep_closing_modal_parent = node
+            .modal
+            .borrow()
+            .as_ref()
+            .is_some_and(|modal| modal.closing());
         if !retain {
-            *node.mount_parent.borrow_mut() = std::rc::Weak::new();
+            if !keep_closing_modal_parent {
+                *node.mount_parent.borrow_mut() = std::rc::Weak::new();
+            }
             *node.retained_owner.borrow_mut() = std::rc::Weak::new();
             node.culled_by_scroll.set(false);
         }
@@ -1940,12 +2251,13 @@ impl Mounter {
     fn delete_now_inner(&mut self, id: NodeId) -> Result<()> {
         self.uncreated_scroll_content.remove(&id);
         if self.desktop.hosted_main_window == Some(id) {
-            self.desktop.hosted_main_window = None;
+            self.close_hosted_main_window(id, None)?;
         }
         if !self.nodes.contains_key(&id) {
             return Ok(());
         }
         self.orphan_subtree(id)?;
+        self.nodes_index.borrow_mut().remove(&id);
         if let Some(node) = self.nodes.remove(&id) {
             if node.kind == ViewKind::Stack
                 && let Ok(index) = self.stacks.binary_search(&id)
@@ -2010,7 +2322,9 @@ impl Mounter {
         if nested {
             result
         } else {
-            result.and(self.flush_arkui())
+            result
+                .and(self.flush_pending_main_park())
+                .and(self.flush_arkui())
         }
     }
 
@@ -2175,6 +2489,9 @@ impl Mounter {
                         {
                             scroll.size(size)?;
                         }
+                        self.nodes_index
+                            .borrow_mut()
+                            .insert(id, Rc::downgrade(&created));
                         self.nodes.insert(id, created);
                         motion.note_created(id);
                         if kind == ViewKind::Stack {
@@ -2183,6 +2500,7 @@ impl Mounter {
                         }
                         let modal = self.node(id)?.modal.borrow().as_ref().map(Rc::downgrade);
                         if let Some(modal) = modal {
+                            self.modals_index.borrow_mut().push(modal.clone());
                             self.modals.push(modal);
                         }
                     }
@@ -2417,8 +2735,14 @@ impl Mounter {
                     }
                     MountItem::ModalConfig { id, config } => {
                         if !self.frozen(id) {
+                            let host_sub_window = (config.window != nsh_core::ROOT_ID)
+                                .then(|| self.nodes.get(&config.window))
+                                .flatten()
+                                .and_then(|win| win.modal.borrow().clone())
+                                .filter(|modal| modal.is_desktop_window());
                             let node = self.node(id)?;
                             if let Some(modal) = node.modal.borrow().as_ref() {
+                                modal.set_host_sub_window(host_sub_window);
                                 modal.configure(config)?;
                                 if node.scene_active() {
                                     node.invalidate_scene();
@@ -2656,8 +2980,11 @@ impl Mounter {
                             }
                         }
                         // Mode controls the desktop FPS overlay. Collection is
-                        // independent on mobile. Orientations are iOS/Android-only.
-                        Command::PerfMonitorMode(_) | Command::Orientations(_) => {}
+                        // independent on mobile.
+                        Command::PerfMonitorMode(_) => {}
+                        Command::Orientations(bits) => {
+                            self.host.orientations(self.dispatcher.clone(), bits)?;
+                        }
                         Command::Back => self.back_fallback()?,
                         Command::ExitApp => {
                             if self.platform.get().os.is_desktop() {
@@ -2699,7 +3026,6 @@ impl Mounter {
                         | Command::ReadClipboardFiles { .. }
                         | Command::SetClipboard(_)
                         | Command::ReadClipboard { .. }
-                        | Command::Speech(_)
                         | Command::Notification(_)) => {
                             self.host.system.command(
                                 &self.host,
@@ -2841,6 +3167,30 @@ impl Mounter {
                         | Command::SetAppUrl(_)
                         | Command::PushAppUrl(_)
                         | Command::CancelPress => {}
+                        Command::TextLocale(locale) => {
+                            if self.text_locale.replace(Some(locale)) != Some(locale) {
+                                for node in self.nodes.values() {
+                                    node.accessibility_state.on_locale_change(node)?;
+                                }
+                            }
+                        }
+                        Command::OpenAppSettings { id } => {
+                            if let Err(error) = self.host.system.open_app_settings(
+                                &self.host,
+                                self.dispatcher.clone(),
+                                id,
+                            ) {
+                                log::warn!("OHOS open app settings failed: {error}");
+                                self.control.dispatch_event(
+                                    nsh_core::ROOT_ID,
+                                    nsh_core::EventKind::OpenAppSettings,
+                                    nsh_core::EventPayload::Map(vec![
+                                        ("id", nsh_core::PayloadValue::Number(f64::from(id))),
+                                        ("opened", nsh_core::PayloadValue::Bool(false)),
+                                    ]),
+                                );
+                            }
+                        }
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
                         }
@@ -3050,6 +3400,9 @@ impl Mounter {
         }
         demand = demand.merge(UiDemand::from_animation(self.shaders.frame()?, None));
         self.modals.retain(|modal| modal.strong_count() > 0);
+        self.modals_index
+            .borrow_mut()
+            .retain(|modal| modal.strong_count() > 0);
         let closing_modals_before = self
             .modals
             .iter()
@@ -3128,6 +3481,9 @@ impl Mounter {
         platform.window = content_size.into();
         self.platform.set(platform);
         for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
+            if modal.is_desktop_window() || modal.is_sub_window_modal() {
+                continue;
+            }
             modal.refresh_metrics();
             if let Some(id) = modal.node_id() {
                 self.node(id)?
@@ -3157,6 +3513,7 @@ impl Mounter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn input_paste(
         &self,
         id: NodeId,
@@ -3164,17 +3521,30 @@ impl Mounter {
         html: Option<String>,
         files: Option<String>,
         image: Option<String>,
+        image_too_large: Option<u64>,
         report_only: bool,
+        expected_edit_gen: u64,
     ) -> Result<()> {
         if let Some(node) = self.nodes.get(&id)
             && let Some(input) = node.input.borrow().as_ref()
         {
-            input.complete_paste(text, html, files, image, report_only)?;
+            input.complete_paste(
+                text,
+                html,
+                files,
+                image,
+                image_too_large,
+                report_only,
+                expected_edit_gen,
+            )?;
         }
         Ok(())
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
+        self.desktop.hosted_main_window = None;
+        self.desktop.pending_park_main = false;
+        self.desktop.main_window_parked = false;
         self.scroll_watchers.clear_nodes();
         self.dialogs.clear();
         self.audio.close();

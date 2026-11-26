@@ -20,6 +20,7 @@ import pointer from "@ohos.multimodalInput.pointer";
 import {
   EditorEventPayload,
   EditorKeyEventPayload,
+  EditorPlannedEdit,
   EditorReceipt,
   MenuActionPayload,
   NshRuntimeContext,
@@ -33,6 +34,7 @@ import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames"
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
 import { startAbilityForResult } from "./NativeExtensions";
+import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -51,8 +53,8 @@ interface AvoidAreaPayload {
 }
 
 interface HostInitPayload {
-  speechAvailable: boolean;
   shareAvailable: boolean;
+  speechAvailable: boolean;
   sdkApiVersion: number;
   deviceType: string;
   cacheDir: string;
@@ -86,6 +88,7 @@ interface HostCommandPayload {
   limit?: number;
   filters?: string[];
   url?: string;
+  orientations?: number;
 }
 
 interface PickedDescriptor {
@@ -110,6 +113,7 @@ interface NshNativeModule {
   ): number;
   nshCloseSession(sessionId: number): void;
   nshServiceEvent(sessionId: number, key: number, event: SystemReply): void;
+  nshSpeechEvent(sessionId: number, key: number, event: SpeechReply): void;
   nshDesktopEvent(sessionId: number, kind: string, payload: string): void;
   nshAttachSubWindow(
     sessionId: number,
@@ -166,6 +170,19 @@ interface NshNativeModule {
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   nshEditorKeyEvent(targetId: number, event: EditorKeyEventPayload): boolean;
+  nshEditorPlanEdit(
+    targetId: number,
+    current: string,
+    start: number,
+    end: number,
+    inserted: string,
+    normalizePaste: boolean,
+  ): EditorPlannedEdit;
+  nshEditorPlanReplace(
+    targetId: number,
+    previous: string,
+    candidate: string,
+  ): EditorPlannedEdit;
   nshViewAction(action: MenuActionPayload): boolean;
   nshWebControllerAttached(targetId: number, nativeTag: string): boolean;
   nshWebNavigate(targetId: number, url: string): boolean;
@@ -271,6 +288,7 @@ class ComponentRuntimeContext implements NshRuntimeContext {
   private themeColorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private focusHandler?: (componentId: string) => boolean;
   private uiContextResolver?: (componentId: string) => UIContext | undefined;
+  private windowUIContextResolver?: (windowId: number) => UIContext | undefined;
 
   constructor(ui: UIContext, mod: NshNativeModule) {
     this.ui = ui;
@@ -293,8 +311,16 @@ class ComponentRuntimeContext implements NshRuntimeContext {
     this.uiContextResolver = resolver;
   }
 
+  setWindowUIContextResolver(resolver?: (windowId: number) => UIContext | undefined): void {
+    this.windowUIContextResolver = resolver;
+  }
+
   getUIContextFor(componentId: string): UIContext {
     return this.uiContextResolver?.(componentId) ?? this.ui;
+  }
+
+  getWindowUIContext(windowId: number): UIContext | undefined {
+    return this.windowUIContextResolver?.(windowId);
   }
 
   requestFocus(componentId: string): boolean {
@@ -376,6 +402,46 @@ class ComponentRuntimeContext implements NshRuntimeContext {
       return this.mod.nshEditorKeyEvent(targetId, event);
     } catch {
       return false;
+    }
+  }
+
+  editorPlanEdit(
+    targetId: number,
+    current: string,
+    start: number,
+    end: number,
+    inserted: string,
+    normalizePaste: boolean,
+  ): EditorPlannedEdit {
+    if (!this.active) {
+      return { text: current, clipped: "", caret: start, changed: false };
+    }
+    try {
+      return this.mod.nshEditorPlanEdit(
+        targetId,
+        current,
+        start,
+        end,
+        inserted,
+        normalizePaste,
+      );
+    } catch {
+      return { text: current, clipped: "", caret: start, changed: false };
+    }
+  }
+
+  editorPlanReplace(
+    targetId: number,
+    previous: string,
+    candidate: string,
+  ): EditorPlannedEdit {
+    if (!this.active) {
+      return { text: previous, clipped: "", caret: previous.length, changed: false };
+    }
+    try {
+      return this.mod.nshEditorPlanReplace(targetId, previous, candidate);
+    } catch {
+      return { text: previous, clipped: "", caret: previous.length, changed: false };
     }
   }
 
@@ -483,6 +549,7 @@ class HostSession {
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
   private readonly system: NativeSystem;
+  private readonly speech: NativeSpeech;
   private readonly desktop?: NativeDesktop;
   private readonly isDesktop: boolean;
   private readonly plugin: NshPlugin = new NshPlugin();
@@ -492,6 +559,8 @@ class HostSession {
   private savedStatusVisible: boolean = true;
   private savedNavigationVisible: boolean = true;
   private barsWork: Promise<void> = Promise.resolve();
+  private savedOrientation?: window.Orientation;
+  private orientationWork: Promise<void> = Promise.resolve();
   private envCallbackId?: number;
   private lifecycleCallbackId?: number;
   private screenReaderHandler?: (enabled: boolean) => void;
@@ -675,6 +744,7 @@ class HostSession {
         this.mod.nshServiceEvent(this.sessionId, key, event),
       );
       this.system = system;
+      this.speech = new NativeSpeech(abilityContext);
       this.isDesktop = isDesktopDevice(deviceInfo.deviceType);
       if (this.isDesktop) {
         this.desktop = new NativeDesktop(
@@ -709,6 +779,9 @@ class HostSession {
         );
         this.runtimeContext.setUIContextResolver((componentId: string): UIContext | undefined =>
           this.desktop?.resolveComponentUIContext(componentId),
+        );
+        this.runtimeContext.setWindowUIContextResolver((windowId: number): UIContext | undefined =>
+          this.desktop?.getSubWindowUIContext(windowId),
         );
         try {
           abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);
@@ -861,12 +934,16 @@ class HostSession {
       } catch {}
     }
     this.desktop?.close();
+    this.speech.close();
     this.system.close();
     try {
       this.updateCursor("auto");
     } catch {}
     try {
       this.updateSystemBars();
+    } catch {}
+    try {
+      this.updateOrientations(0);
     } catch {}
 
     if (this.windowStage !== undefined) {
@@ -1081,6 +1158,44 @@ class HostSession {
       });
   }
 
+  private updateOrientations(bits: number): void {
+    if (this.isDesktop) {
+      return;
+    }
+    const mask = bits & 0x0f;
+    // Serialize orientation transitions in arrival order so a restore never
+    // races ahead of an earlier page restriction.
+    this.orientationWork = this.orientationWork
+      .then(async (): Promise<void> => {
+        if (mask === 0) {
+          const saved = this.savedOrientation;
+          if (saved === undefined) {
+            return;
+          }
+          this.savedOrientation = undefined;
+          await this.mainWindow.setPreferredOrientation(saved);
+          return;
+        }
+        if (this.savedOrientation === undefined) {
+          try {
+            this.savedOrientation = this.mainWindow.getPreferredOrientation();
+          } catch {
+            this.savedOrientation = window.Orientation.UNSPECIFIED;
+          }
+        }
+        const target = resolvePreferredOrientation(mask);
+        await this.mainWindow.setPreferredOrientation(target);
+      })
+      .catch((error: Error): void => {
+        if (!this.closed) {
+          this.mod.nshReportHostError(
+            this.sessionId,
+            `OHOS preferred orientation update: ${String(error)}`,
+          );
+        }
+      });
+  }
+
   private updateCursor(name: string, windowId?: number): void {
     const controller = this.runtimeContext.getUIContext().getCursorController();
     if (name === "none") {
@@ -1206,6 +1321,29 @@ class HostSession {
       this.system.cancel(command.openId ?? 0);
       return;
     }
+    if (command.kind === "speech-start") {
+      const key = command.openId ?? 0;
+      this.speech
+        .start(key, command.text, command.enabled ?? true, (event: SpeechReply): void => {
+          if (!this.closed) {
+            this.mod.nshSpeechEvent(this.sessionId, key, event);
+          }
+        })
+        .catch((error: Error) => console.error(`NSH speech start: ${error}`));
+      return;
+    }
+    if (command.kind === "speech-stop") {
+      this.speech
+        .stop(command.openId ?? 0, false)
+        .catch((error: Error) => console.error(`NSH speech stop: ${error}`));
+      return;
+    }
+    if (command.kind === "speech-abort") {
+      this.speech
+        .stop(command.openId ?? 0, true)
+        .catch((error: Error) => console.error(`NSH speech abort: ${error}`));
+      return;
+    }
     if (command.kind === "desktop") {
       this.desktop?.execute(command.text ?? "{}");
       return;
@@ -1220,6 +1358,10 @@ class HostSession {
     }
     if (command.kind === "video-fullscreen" || command.kind === "status-bar") {
       this.updateSystemBars(command);
+      return;
+    }
+    if (command.kind === "orientations") {
+      this.updateOrientations(command.orientations ?? 0);
       return;
     }
     if (command.kind === "appearance") {
@@ -1487,4 +1629,32 @@ function maximumRefreshRate(mainWindow: window.Window): number | undefined {
     screen.refreshRate,
   );
   return rate > 0 ? rate : undefined;
+}
+
+// Maps NSH ModalConfig orientation bitmask (Portrait=1, PortraitUpsideDown=2,
+// LandscapeLeft=4, LandscapeRight=8) to HarmonyOS `window.Orientation`.
+// HarmonyOS has no arbitrary 2- or 3-orientation subset (e.g. Portrait + LandscapeLeft);
+// mixed portrait+landscape subsets degrade to `AUTO_ROTATION_RESTRICTED` (honoring
+// the Control Panel rotation lock) while all-4 uses `AUTO_ROTATION_RESTRICTED`.
+function resolvePreferredOrientation(mask: number): window.Orientation {
+  const PORTRAIT = 1;
+  const PORTRAIT_UPSIDE_DOWN = 2;
+  const LANDSCAPE_LEFT = 4;
+  const LANDSCAPE_RIGHT = 8;
+  switch (mask & 0x0f) {
+    case PORTRAIT:
+      return window.Orientation.PORTRAIT;
+    case PORTRAIT_UPSIDE_DOWN:
+      return window.Orientation.PORTRAIT_INVERTED;
+    case LANDSCAPE_LEFT:
+      return window.Orientation.LANDSCAPE;
+    case LANDSCAPE_RIGHT:
+      return window.Orientation.LANDSCAPE_INVERTED;
+    case PORTRAIT | PORTRAIT_UPSIDE_DOWN:
+      return window.Orientation.AUTO_ROTATION_PORTRAIT_RESTRICTED;
+    case LANDSCAPE_LEFT | LANDSCAPE_RIGHT:
+      return window.Orientation.AUTO_ROTATION_LANDSCAPE_RESTRICTED;
+    default:
+      return window.Orientation.AUTO_ROTATION_RESTRICTED;
+  }
 }

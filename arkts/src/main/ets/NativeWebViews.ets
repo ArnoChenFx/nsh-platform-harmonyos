@@ -15,6 +15,7 @@ export interface WebSettings {
   loadGeneration: number;
   javaScriptEnabled: boolean;
   scrollEnabled: boolean;
+  zoomable: boolean;
   userAgent?: string | null;
   injectedJavascript?: string | null;
   documentStartScript: string;
@@ -116,6 +117,7 @@ function documentStartScriptRules(schemes: string[]): string[] {
 @Observed
 class WebViewState {
   revealed: boolean = false;
+  zoomable: boolean = false;
 }
 
 @Component
@@ -137,6 +139,7 @@ struct WebViewHost {
       .backgroundColor(Color.Transparent)
       .hitTestBehavior(HitTestMode.Block)
       .javaScriptAccess(this.entry.settings.javaScriptEnabled)
+      .zoomAccess(this.state.zoomable)
       .domStorageAccess(true)
       .fileAccess(false)
       .onlineImageAccess(true)
@@ -199,6 +202,9 @@ struct WebViewHost {
       })
       .onRenderExited(() => {
         this.entry.emit("render-exited");
+      })
+      .onTouch((event: TouchEvent): void => {
+        this.entry.onTouch(event);
       });
   }
 }
@@ -267,6 +273,7 @@ class WebEntry {
   constructor(settings: WebSettings, context: NshRuntimeContext) {
     this.settings = settings;
     this.context = context;
+    this.viewState.zoomable = settings.zoomable;
     this.node = new BuilderNode<[WebContentParams]>(context.getUIContext());
   }
 
@@ -536,6 +543,7 @@ class WebEntry {
     }
     settings.clearCookies = settings.clearCookies || this.settings.clearCookies;
     this.settings = settings;
+    this.viewState.zoomable = settings.zoomable;
     if (!this.controllerReady) {
       return;
     }
@@ -778,6 +786,27 @@ class WebEntry {
       canGoForward,
       message,
       code,
+    });
+  }
+
+  onTouch(event: TouchEvent): void {
+    if (this.closed || !this.context.isActive() || event.type !== TouchType.Down) {
+      return;
+    }
+    const touch = event.touches[0] ?? event.changedTouches[0];
+    if (!touch) {
+      return;
+    }
+    this.context.webEvent({
+      targetId: this.settings.targetId,
+      phase: "press",
+      url: "",
+      title: "",
+      loading: this.loading,
+      canGoBack: false,
+      canGoForward: false,
+      x: touch.windowX,
+      y: touch.windowY,
     });
   }
 

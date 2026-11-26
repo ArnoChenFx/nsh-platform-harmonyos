@@ -23,7 +23,7 @@ struct Request<R> {
     id: u32,
     stream: bool,
     answer: bool,
-    paste: Option<(u32, bool)>,
+    paste: Option<(u32, bool, Option<u64>, u64)>,
 }
 
 impl<R> Clone for Request<R> {
@@ -81,19 +81,25 @@ pub(crate) struct System {
 
 #[cfg(target_env = "ohos")]
 impl System {
+    /// Writes plain text to the system clipboard on the serialized worker
+    /// without emitting a `ClipboardWrite` receipt to core.
+    pub(crate) fn copy_clipboard(&self, text: String) -> napi_ohos::Result<()> {
+        self.clipboard.copy_text(text)
+    }
+
     pub(crate) fn command(
         &self,
         host: &std::sync::Arc<Services>,
         route: Weak<Dispatcher>,
         command: Command,
     ) -> napi_ohos::Result<()> {
-        use nsh_core::{notifications::NotificationCommand as N, speech::SpeechCommand as S};
+        use nsh_core::notifications::NotificationCommand as N;
         match command {
             Command::SetClipboardItem(item) => {
-                return self.clipboard.write_text(item.text, item.html);
+                return self.clipboard.write_text(route, item.text, item.html);
             }
             Command::SetClipboard(text) => {
-                return self.clipboard.write_text(text, None);
+                return self.clipboard.write_text(route, text, None);
             }
             Command::SetClipboardImage(uri) => {
                 return self.clipboard.write_image(uri);
@@ -159,45 +165,6 @@ impl System {
                     }
                 };
                 (EventKind::Notification, id, stream, data)
-            }
-            Command::Speech(command) => {
-                let (id, data) = match command {
-                    S::Start { id, request } => (
-                        id,
-                        SystemCommand {
-                            op: "speech-start".into(),
-                            lang: request.lang,
-                            interim: Some(request.interim),
-                            ..Default::default()
-                        },
-                    ),
-                    S::Stop { id } | S::Abort { id } => {
-                        let key = self.requests.lock().unwrap().iter().find_map(|(&key, r)| {
-                            (r.kind == EventKind::Speech
-                                && r.id == id
-                                && Weak::ptr_eq(&r.route, &route))
-                            .then_some(key)
-                        });
-                        if let Some(key) = key {
-                            let abort = matches!(command, S::Abort { .. });
-                            if abort {
-                                self.requests.lock().unwrap().remove(&key);
-                            }
-                            host.send_host_command(HostCommand {
-                                kind: "system".into(),
-                                open_id: Some(key),
-                                system: Some(SystemCommand {
-                                    op: if abort { "speech-abort" } else { "speech-stop" }.into(),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            })?;
-                        }
-                        return Ok(());
-                    }
-                    _ => return Err(napi_ohos::Error::from_reason("unsupported speech command")),
-                };
-                (EventKind::Speech, id, true, data)
             }
             Command::AuthSession { id, page } => {
                 // One auth session runs at a time per route; cancel any prior pending entry
@@ -310,15 +277,47 @@ impl System {
         )
     }
 
+    pub(crate) fn open_app_settings(
+        &self,
+        host: &Services,
+        route: Weak<Dispatcher>,
+        id: u32,
+    ) -> napi_ohos::Result<()> {
+        self.submit(
+            host,
+            Request {
+                route,
+                kind: EventKind::OpenAppSettings,
+                id,
+                stream: false,
+                answer: true,
+                paste: None,
+            },
+            SystemCommand {
+                op: "open-app-settings".into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn paste_to_input(
         &self,
         host: &std::sync::Arc<Services>,
         route: Weak<Dispatcher>,
         node_id: u32,
         report_only: bool,
+        paste_max_size: Option<u64>,
+        expected_edit_gen: u64,
     ) -> napi_ohos::Result<()> {
-        self.clipboard
-            .paste_to_input(host.clone(), route, node_id, report_only)
+        self.clipboard.paste_to_input(
+            host.clone(),
+            route,
+            node_id,
+            report_only,
+            paste_max_size,
+            expected_edit_gen,
+        )
     }
 
     pub(crate) fn file_request(
@@ -419,7 +418,7 @@ impl System {
         route: Weak<Dispatcher>,
         id: u32,
         op: &str,
-        paste: Option<(u32, bool)>,
+        paste: Option<(u32, bool, Option<u64>, u64)>,
     ) -> napi_ohos::Result<()> {
         self.submit(
             host,
@@ -433,6 +432,7 @@ impl System {
             },
             SystemCommand {
                 op: op.into(),
+                max_bytes: paste.and_then(|(_, _, max, _)| max).map(|m| m as f64),
                 ..Default::default()
             },
         )
@@ -508,19 +508,30 @@ impl System {
         else {
             return;
         };
-        if let Some((node_id, report_only)) = request.paste {
+        if let Some((node_id, report_only, _paste_max_size, expected_edit_gen)) = request.paste {
             let text = value.text.unwrap_or_default();
             let html = value.html.filter(|s| !s.is_empty());
             let files = value.files.filter(|s| !s.is_empty());
             let image = value.uri.filter(|s| !s.is_empty());
-            if !text.is_empty() || html.is_some() || files.is_some() || image.is_some() {
+            let image_too_large = value
+                .too_large
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| v.round() as u64);
+            if !text.is_empty()
+                || html.is_some()
+                || files.is_some()
+                || image.is_some()
+                || image_too_large.is_some()
+            {
                 route.send(Message::InputPaste {
                     id: node_id,
                     text,
                     html,
                     files,
                     image,
+                    image_too_large,
                     report_only,
+                    expected_edit_gen,
                 });
             }
             return;
@@ -543,23 +554,19 @@ impl System {
                     parse_file_request_paths(value.files.as_deref()),
                 ),
             }
-        } else if request.kind == EventKind::Speech {
-            use nsh_core::speech::{SpeechError, SpeechEvent as E};
-            let event = match value.phase.as_deref() {
-                Some("start") => E::Start,
-                Some("result") => E::Result {
-                    text: value.text.clone().unwrap_or_default(),
-                    is_final: value.is_final.unwrap_or(false),
-                },
-                Some("end") => E::End {
-                    error: value.error.as_deref().and_then(SpeechError::from_name),
-                },
-                _ => return,
-            };
-            EventPayload::Speech {
-                id: request.id,
-                event,
+        } else if request.kind == EventKind::Clipboard {
+            if let Some(error) = value.error.as_deref() {
+                log::warn!("OHOS clipboard request failed: {error}");
             }
+            clipboard_payload(request.id, value)
+        } else if request.kind == EventKind::OpenAppSettings {
+            EventPayload::Map(vec![
+                ("id", PayloadValue::Number(f64::from(request.id))),
+                (
+                    "opened",
+                    PayloadValue::Bool(value.error.is_none() && value.opened.unwrap_or(false)),
+                ),
+            ])
         } else {
             if let Some(error) = value.error.as_deref() {
                 route.send(Message::Error(format!("system service: {error}")));
@@ -607,6 +614,7 @@ pub(crate) struct SystemCommand {
     pub body: Option<String>,
     pub silent: Option<bool>,
     pub count: Option<u32>,
+    pub max_bytes: Option<f64>,
     pub ask: Option<bool>,
     pub lang: Option<String>,
     pub interim: Option<bool>,
@@ -627,14 +635,16 @@ impl SystemCommand {
     }
 }
 
-/// Typed completion shared by clipboard, notification and speech services.
+/// Typed completion shared by clipboard, notification and system services.
 #[cfg_attr(target_env = "ohos", napi_derive_ohos::napi(object))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SystemEvent {
     pub permission: Option<String>,
     pub shown: Option<bool>,
+    pub opened: Option<bool>,
     pub pressed: Option<String>,
     pub has: Option<bool>,
+    pub denied: Option<bool>,
     pub text: Option<String>,
     pub html: Option<String>,
     pub uri: Option<String>,
@@ -676,7 +686,12 @@ impl SystemEvent {
                 fields.push((name, PayloadValue::Str(value)));
             }
         }
-        for (name, value) in [("shown", self.shown), ("has", self.has)] {
+        for (name, value) in [
+            ("shown", self.shown),
+            ("has", self.has),
+            ("denied", self.denied),
+            ("opened", self.opened),
+        ] {
             if let Some(value) = value {
                 fields.push((name, PayloadValue::Bool(value)));
             }
@@ -723,51 +738,180 @@ impl PickedDescriptor {
 }
 
 #[cfg(unix)]
-pub(crate) fn read_picked(
+const MAX_PICKED_IMAGE_BYTES: u64 = 64 << 20;
+
+#[cfg(unix)]
+const PICKED_READ_CHUNK: usize = 64 * 1024;
+
+#[cfg(unix)]
+fn read_bounded_file<R: std::io::Read>(
+    reader: &mut R,
+    name: String,
+    limit: u64,
+    modified: Option<std::time::SystemTime>,
+    mut known_regular_size: impl FnMut(&R) -> Option<u64>,
+) -> Option<nsh_core::picker::PickedFile> {
+    if let Some(len) = known_regular_size(reader)
+        && len > limit
+    {
+        log::warn!("OHOS picked {name} is too large ({len} > {limit} bytes)");
+        let mut picked = nsh_core::picker::PickedFile::too_large(name, "", len);
+        picked.last_modified = modified;
+        return Some(picked);
+    }
+
+    let mut chunk = [0u8; PICKED_READ_CHUNK];
+    let mut total: u64 = 0;
+    let mut bytes: Option<Vec<u8>> = Some(Vec::new());
+    let mut sniffed_mime: Option<&'static str> = None;
+
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                log::warn!("OHOS picked {name} read failed: {err}");
+                return None;
+            }
+        };
+        let next_total = total.saturating_add(n as u64);
+        if let Some(buf) = bytes.as_mut() {
+            if next_total <= limit {
+                buf.extend_from_slice(&chunk[..n]);
+                total = next_total;
+                continue;
+            }
+            sniffed_mime = if !buf.is_empty() {
+                nsh_core::picker::sniff(buf).or_else(|| nsh_core::picker::sniff(&chunk[..n]))
+            } else {
+                nsh_core::picker::sniff(&chunk[..n])
+            };
+            bytes = None;
+            total = next_total;
+            if let Some(len) = known_regular_size(reader)
+                && len > limit
+            {
+                total = len.max(total);
+                break;
+            }
+        } else {
+            total = next_total;
+        }
+    }
+
+    let mut picked = match bytes {
+        Some(data) => {
+            let mut picked = nsh_core::picker::PickedFile::default();
+            picked.name = name;
+            picked.data = data.into();
+            picked
+        }
+        None => nsh_core::picker::PickedFile::too_large(name, sniffed_mime.unwrap_or(""), total),
+    };
+    picked.last_modified = modified;
+    Some(picked)
+}
+
+#[cfg(unix)]
+fn read_picked_images_with(
     handles: Vec<PickedHandle>,
-    request: &nsh_core::picker::Pick,
+    request: &nsh_core::picker::PickRequest,
+    mut prepare: impl FnMut(
+        Vec<u8>,
+        &str,
+        &nsh_core::picker::PickRequest,
+    ) -> Option<nsh_core::picker::PickedFile>,
 ) -> Vec<nsh_core::picker::PickedFile> {
     use std::{fs::File, io::Read as _};
-    let (limit, max_bytes) = match request {
-        nsh_core::picker::Pick::Images(r) => (r.limit, 64 << 20),
-        nsh_core::picker::Pick::Files(r) => (r.limit, nsh_core::picker::MAX_PICKED_FILE_BYTES),
-    };
+    let limit = request.limit.clamp(1, nsh_core::picker::MAX_PICKED) as usize;
     let raw = handles
         .into_iter()
-        .take(limit.clamp(1, nsh_core::picker::MAX_PICKED) as usize)
+        .take(limit)
         .filter_map(|handle| {
             let file = File::from(handle.descriptor);
             let metadata = file.metadata().ok();
-            if metadata.as_ref().is_some_and(|m| m.len() > max_bytes) {
+            if metadata
+                .as_ref()
+                .is_some_and(|m| m.is_file() && m.len() > MAX_PICKED_IMAGE_BYTES)
+            {
                 log::warn!(
-                    "OHOS picked {} is left out: larger than {max_bytes} bytes",
+                    "OHOS picked image {} is left out: larger than {MAX_PICKED_IMAGE_BYTES} bytes",
                     handle.name
                 );
                 return None;
             }
             let modified = metadata.and_then(|m| m.modified().ok());
             let mut bytes = Vec::new();
-            if file.take(max_bytes + 1).read_to_end(&mut bytes).is_err()
-                || bytes.len() as u64 > max_bytes
+            if file
+                .take(MAX_PICKED_IMAGE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() as u64 > MAX_PICKED_IMAGE_BYTES
             {
                 return None;
             }
-            let mut picked = match request {
-                nsh_core::picker::Pick::Images(_) => {
-                    nsh_core::picker::PickedFile::new(handle.name, "", bytes.into())
-                }
-                nsh_core::picker::Pick::Files(_) => {
-                    let mut picked = nsh_core::picker::PickedFile::default();
-                    picked.name = handle.name;
-                    picked.data = bytes.into();
-                    picked
-                }
-            };
+            let mut picked = prepare(bytes, &handle.name, request)?;
             picked.last_modified = modified;
             Some(picked)
         })
         .collect();
-    request.finish(raw)
+    nsh_core::picker::finish(request, raw)
+}
+
+#[cfg(unix)]
+fn read_picked_files(
+    handles: Vec<PickedHandle>,
+    request: &nsh_core::picker::FilePickRequest,
+) -> Vec<nsh_core::picker::PickedFile> {
+    use std::fs::File;
+    let max_count = request.limit.clamp(1, nsh_core::picker::MAX_PICKED) as usize;
+    let size_limit = request.size_limit();
+    let raw = handles
+        .into_iter()
+        .take(max_count)
+        .filter_map(|handle| {
+            let mut file = File::from(handle.descriptor);
+            let metadata = file.metadata().ok();
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+            let initial_regular_len = metadata.as_ref().filter(|m| m.is_file()).map(|m| m.len());
+            let mut first_check = true;
+            read_bounded_file(&mut file, handle.name, size_limit, modified, |file| {
+                if first_check {
+                    first_check = false;
+                    initial_regular_len
+                } else {
+                    file.metadata()
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                }
+            })
+        })
+        .collect();
+    nsh_core::picker::finish_files(request, raw)
+}
+
+#[cfg(unix)]
+pub(crate) fn read_picked(
+    handles: Vec<PickedHandle>,
+    request: &nsh_core::picker::Pick,
+) -> Vec<nsh_core::picker::PickedFile> {
+    match request {
+        nsh_core::picker::Pick::Images(r) => {
+            #[cfg(target_env = "ohos")]
+            {
+                read_picked_images_with(handles, r, crate::extensions::prepare_image_owned)
+            }
+            #[cfg(not(target_env = "ohos"))]
+            {
+                read_picked_images_with(handles, r, |bytes, name, _| {
+                    Some(nsh_core::picker::PickedFile::new(name, "", bytes.into()))
+                })
+            }
+        }
+        nsh_core::picker::Pick::Files(r) => read_picked_files(handles, r),
+    }
 }
 
 /// Formats `FileFilter` entries for HarmonyOS `DocumentSelectOptions.fileSuffixFilters`
@@ -868,6 +1012,22 @@ pub(crate) fn auth_session_payload(id: u32, value: SystemEvent) -> nsh_core::Eve
         return AuthSessionOutcome::Completed(url).payload(id);
     }
     AuthSessionOutcome::Cancelled.payload(id)
+}
+
+/// Converts a `NativeClipboard` reply into the `EventKind::Clipboard` payload.
+/// User dismissal or read errors resolve as `denied: true` instead of surfacing
+/// as an uncaught host error overlay.
+pub(crate) fn clipboard_payload(id: u32, value: SystemEvent) -> nsh_core::EventPayload {
+    if value.error.is_some() || value.denied == Some(true) {
+        return EventPayload::Map(vec![
+            ("id", PayloadValue::Number(f64::from(id))),
+            ("has", PayloadValue::Bool(false)),
+            ("denied", PayloadValue::Bool(true)),
+        ]);
+    }
+    let mut fields = vec![("id", PayloadValue::Number(f64::from(id)))];
+    value.append_fields(&mut fields);
+    EventPayload::Map(fields)
 }
 
 #[cfg(test)]
@@ -981,7 +1141,7 @@ mod tests {
         let owner = std::sync::Arc::new(());
         let mut requests = BTreeMap::new();
         for (key, kind, stream) in [
-            (1, EventKind::Speech, true),
+            (1, EventKind::AuthSession, true),
             (2, EventKind::Notification, false),
             (3, EventKind::Notification, true),
             (4, EventKind::Notification, true),
@@ -1109,5 +1269,284 @@ mod tests {
             "code",
             PayloadValue::Str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into())
         )));
+    }
+
+    #[test]
+    fn clipboard_payload_maps_cancelled_and_error_replies_to_denied() {
+        let cancelled = clipboard_payload(
+            11,
+            SystemEvent {
+                has: Some(false),
+                denied: Some(true),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = cancelled else {
+            panic!("expected Map payload");
+        };
+        assert_eq!(
+            fields,
+            vec![
+                ("id", PayloadValue::Number(11.0)),
+                ("has", PayloadValue::Bool(false)),
+                ("denied", PayloadValue::Bool(true)),
+            ]
+        );
+
+        let failed = clipboard_payload(
+            12,
+            SystemEvent {
+                error: Some("paste cancelled".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = failed else {
+            panic!("expected Map payload");
+        };
+        assert_eq!(
+            fields,
+            vec![
+                ("id", PayloadValue::Number(12.0)),
+                ("has", PayloadValue::Bool(false)),
+                ("denied", PayloadValue::Bool(true)),
+            ]
+        );
+
+        let ok = clipboard_payload(
+            13,
+            SystemEvent {
+                has: Some(true),
+                text: Some("hello".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = ok else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(13.0))));
+        assert!(fields.contains(&("has", PayloadValue::Bool(true))));
+        assert!(fields.contains(&("text", PayloadValue::Str("hello".into()))));
+        assert!(!fields.iter().any(|(key, _)| *key == "denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_picker_enforces_size_limit_returns_too_large_and_preserves_order() {
+        use std::{fs::File, os::fd::AsRawFd};
+        let dir = std::env::temp_dir().join(format!("nsh-picked-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_handle = |file_name: &str, len: u64, sparse: bool| -> PickedHandle {
+            let path = dir.join(file_name);
+            let file = File::create(&path).unwrap();
+            if sparse {
+                file.set_len(len).unwrap();
+            } else {
+                std::fs::write(&path, vec![b'a'; len as usize]).unwrap();
+            }
+            let opened = File::open(&path).unwrap();
+            PickedDescriptor {
+                fd: opened.as_raw_fd(),
+                name: file_name.to_owned(),
+            }
+            .retain()
+            .unwrap()
+        };
+
+        // Limit = 16 bytes: 15 -> Read, 16 -> Read, 17 -> TooLarge, 512 MiB + 1 sparse -> TooLarge.
+        let mut req = nsh_core::picker::FilePickRequest::default();
+        req.limit = 10;
+        req.max_size = Some(16);
+        let handles = vec![
+            make_handle("below.txt", 15, false),
+            make_handle("exact.txt", 16, false),
+            make_handle("over.json", 17, false),
+            make_handle(
+                "huge.bin",
+                nsh_core::picker::MAX_PICKED_FILE_BYTES + 1,
+                true,
+            ),
+        ];
+        let picked = read_picked(handles, &nsh_core::picker::Pick::Files(req));
+        assert_eq!(picked.len(), 4);
+        assert_eq!(picked[0].name, "below.txt");
+        assert_eq!(picked[0].status, nsh_core::picker::PickedStatus::Read);
+        assert_eq!(picked[0].data.len(), 15);
+        assert_eq!(picked[1].name, "exact.txt");
+        assert_eq!(picked[1].status, nsh_core::picker::PickedStatus::Read);
+        assert_eq!(picked[1].data.len(), 16);
+        assert_eq!(picked[2].name, "over.json");
+        assert_eq!(picked[2].status, nsh_core::picker::PickedStatus::TooLarge);
+        assert!(picked[2].data.is_empty());
+        assert_eq!(picked[2].len, 17);
+        assert_eq!(picked[2].mime, "application/json");
+        assert!(picked[2].last_modified.is_some());
+        assert_eq!(picked[3].name, "huge.bin");
+        assert_eq!(picked[3].status, nsh_core::picker::PickedStatus::TooLarge);
+        assert!(picked[3].data.is_empty());
+        assert_eq!(picked[3].len, nsh_core::picker::MAX_PICKED_FILE_BYTES + 1);
+
+        // Default limit (512 MiB): sparse 512 MiB + 1 file is returned as TooLarge, never dropped.
+        let huge = make_handle(
+            "sparse-over-hard-limit.pdf",
+            nsh_core::picker::MAX_PICKED_FILE_BYTES + 1,
+            true,
+        );
+        let picked_default = read_picked(
+            vec![huge],
+            &nsh_core::picker::Pick::Files(Default::default()),
+        );
+        assert_eq!(picked_default.len(), 1);
+        assert_eq!(
+            picked_default[0].status,
+            nsh_core::picker::PickedStatus::TooLarge
+        );
+        assert_eq!(picked_default[0].mime, "application/pdf");
+        assert_eq!(
+            picked_default[0].len,
+            nsh_core::picker::MAX_PICKED_FILE_BYTES + 1
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_oversized_file_performs_zero_reads_and_unknown_stream_bounds_buffer() {
+        struct CountingReader {
+            data: Vec<u8>,
+            pos: usize,
+            reads: usize,
+        }
+        impl std::io::Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let n = buf.len().min(self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        // Known-size regular file larger than limit must execute 0 read() calls.
+        let mut known = CountingReader {
+            data: vec![b'x'; 200],
+            pos: 0,
+            reads: 0,
+        };
+        let oversized = read_bounded_file(&mut known, "big.bin".into(), 64, None, |_| Some(200))
+            .expect("oversized entry");
+        assert_eq!(known.reads, 0);
+        assert_eq!(oversized.status, nsh_core::picker::PickedStatus::TooLarge);
+        assert_eq!(oversized.len, 200);
+        assert!(oversized.data.is_empty());
+
+        // Unknown-size stream (e.g. pipe) exceeding limit releases bytes and counts exact length.
+        let mut png_header = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png_header.resize(256, 0);
+        let mut stream = CountingReader {
+            data: png_header,
+            pos: 0,
+            reads: 0,
+        };
+        let streamed_over =
+            read_bounded_file(&mut stream, "unnamed".into(), 64, None, |_| None).unwrap();
+        assert!(stream.reads > 0);
+        assert_eq!(
+            streamed_over.status,
+            nsh_core::picker::PickedStatus::TooLarge
+        );
+        assert_eq!(streamed_over.len, 256);
+        assert_eq!(streamed_over.mime, "image/png");
+        assert!(streamed_over.data.is_empty());
+
+        // Zero size limit accepts empty files and marks 1-byte files tooLarge.
+        let mut empty = CountingReader {
+            data: Vec::new(),
+            pos: 0,
+            reads: 0,
+        };
+        let ok_empty =
+            read_bounded_file(&mut empty, "empty.txt".into(), 0, None, |_| None).unwrap();
+        assert_eq!(ok_empty.status, nsh_core::picker::PickedStatus::Read);
+        assert!(ok_empty.data.is_empty());
+        let mut one_byte = CountingReader {
+            data: vec![b'1'],
+            pos: 0,
+            reads: 0,
+        };
+        let over_zero =
+            read_bounded_file(&mut one_byte, "one.txt".into(), 0, None, |_| None).unwrap();
+        assert_eq!(over_zero.status, nsh_core::picker::PickedStatus::TooLarge);
+        assert_eq!(over_zero.len, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_picker_passes_request_to_preparer_and_preserves_modified_and_order() {
+        use nsh_core::geometry::{DevicePixels, Percentage};
+        use std::{fs::File, os::fd::AsRawFd};
+        let dir = std::env::temp_dir().join(format!("nsh-picked-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            let f = File::open(&p).unwrap();
+            PickedDescriptor {
+                fd: f.as_raw_fd(),
+                name: name.to_owned(),
+            }
+            .retain()
+            .unwrap()
+        };
+        let mut req = nsh_core::picker::PickRequest::default();
+        req.limit = 4;
+        req.max_dimension = Some(DevicePixels(4));
+        req.quality = Some(Percentage(0.8));
+        let handles = vec![make("a.png", b"png-a"), make("b.heic", b"heic-b")];
+        let mut seen = Vec::new();
+        let out = read_picked_images_with(handles, &req, |bytes, name, passed| {
+            seen.push((
+                name.to_owned(),
+                bytes.len(),
+                passed.max_dimension,
+                passed.quality,
+            ));
+            let mut f = nsh_core::picker::PickedFile::new(
+                nsh_core::picker::file_name(name, "image/jpeg"),
+                "image/jpeg",
+                b"reencoded".to_vec().into(),
+            );
+            f.size = nsh_core::Size::new(DevicePixels(4), DevicePixels(1));
+            Some(f)
+        });
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0],
+            (
+                "a.png".into(),
+                5,
+                Some(DevicePixels(4)),
+                Some(Percentage(0.8))
+            )
+        );
+        assert_eq!(
+            seen[1],
+            (
+                "b.heic".into(),
+                6,
+                Some(DevicePixels(4)),
+                Some(Percentage(0.8))
+            )
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "a.jpg");
+        assert_eq!(out[1].name, "b.jpg");
+        assert_eq!(out[0].size.width.0, 4);
+        assert_eq!(out[0].size.height.0, 1);
+        assert!(out[0].last_modified.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

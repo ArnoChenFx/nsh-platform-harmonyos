@@ -26,8 +26,11 @@ path = "src/main.rs"
 # the app needs).
 default = []
 # What the HarmonyOS library is built with.
-backend = ["editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "zlib", "crypto"]
+backend = ["editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "zlib", "crypto", "websocket"]
 dev = ["dep:nsh-dev", "dep:nsh-testing", "dep:url"]
+# Registers the HarmonyOS HMS speech recognizer with `nsh-extra`'s `speech`
+# module when an app enables `nsh-extra`'s `speech` feature.
+speech = ["dep:nsh-extra"]
 # The large parts of `nsh/base`, as NSH's Android and iOS backends name them.
 # An app that imports one the library was built without fails at the import,
 # naming it.
@@ -50,6 +53,9 @@ emoji-picker = ["nsh-base/emoji-picker"]
 zlib = ["nsh-engine/zlib"]
 # The standard JS module `crypto` and the globals of Web Crypto.
 crypto = ["nsh-engine/crypto"]
+# The native WebSocket client (`websocket` module `connect`). Without it,
+# `connect` rejects with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`.
+websocket = ["nsh-engine/websocket"]
 # Linked enhancements raise the minimum supported runtime API.
 api-23 = [
   "ohos-arkui-binding/accessibility",
@@ -71,6 +77,8 @@ api-26 = [
 # The CLI, on the computer.
 [target.'cfg(not(target_env = "ohos"))'.dependencies]
 anyhow.workspace = true
+json5.workspace = true
+percent-encoding.workspace = true
 quick-xml.workspace = true
 serde_json.workspace = true
 serde.workspace = true
@@ -89,6 +97,7 @@ getrandom = { workspace = true, features = ["std"] }
 nsh-package.workspace = true
 nsh-dev = { workspace = true, features = ["client"], optional = true }
 nsh-testing = { workspace = true, features = ["agent"], optional = true }
+nsh-extra = { workspace = true, features = ["speech"], optional = true }
 url = { workspace = true, optional = true }
 nsh-engine = { workspace = true, features = ["js"] }
 nsh-base.workspace = true
@@ -141,6 +150,7 @@ unicode-segmentation.workspace = true
 nsh-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
 
 [workspace]
 resolver = "3"
@@ -155,12 +165,13 @@ missing_docs = "warn"
 unreachable_pub = "deny"
 
 [workspace.dependencies]
-nsh-core = "0.6"
-nsh-engine = { version = "0.6", default-features = false }
-nsh-base = { version = "0.6", default-features = false }
-nsh-package = "0.6"
-nsh-dev = "0.6"
-nsh-testing = { version = "0.6", default-features = false }
+nsh-core = "0.7"
+nsh-engine = { version = "0.7", default-features = false }
+nsh-base = { version = "0.7", default-features = false }
+nsh-package = "0.7"
+nsh-dev = "0.7"
+nsh-testing = { version = "0.7", default-features = false }
+nsh-extra = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
@@ -168,6 +179,7 @@ ctrlc = { version = "3", features = ["termination"] }
 anyhow = "1"
 base64 = "0.22"
 getrandom = "0.3"
+json5 = "1.3"
 log = "0.4"
 percent-encoding = "2.3"
 quick-xml = { version = "0.42", features = ["serialize"] }
@@ -177,7 +189,7 @@ thiserror = "2"
 tokio = { version = "1", default-features = false }
 ttf-parser = "0.25"
 unicode-segmentation = "1.13"
-ureq = "3.1"
+ureq = "~3.5.2"
 url = "2.5"
 glow = "0.18"
 khronos-egl = { version = "6", default-features = false, features = ["static", "no-pkg-config", "1_5"] }
@@ -186,7 +198,7 @@ khronos-egl = { version = "6", default-features = false, features = ["static", "
 napi-ohos = { version = "1.2.0", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
 napi-derive-ohos = "1.2.0"
 napi-build-ohos = "1.2.0"
-ohos-arkui-binding = { version = "0.6.3", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
+ohos-arkui-binding = { version = "0.6.4", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
 ohos-accessibility-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
 ohos-display-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
 ohos-device-binding = { version = "0.1.0", default-features = false }
@@ -207,20 +219,6 @@ ohos-native-window-binding = { version = "0.3.3", default-features = false, feat
 ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
 ohos-vibrator-binding = { version = "0.2.4", default-features = false, features = ["api-20"] }
-
-# NSH nightly: its crates from longbridge/nsh `main`, which `nsh update nightly`
-# installs the CLI of. Cargo.lock pins the commit; `cargo update -p nsh-core`
-# moves to the latest night. The runner of a TSX app takes this section too.
-[patch.crates-io]
-nsh-macros = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-core = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-base = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-package = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-js = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-engine = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-testing = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-bundler = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-dev = { git = "https://github.com/longbridge/nsh", branch = "main" }
 
 [profile.release]
 opt-level = 3
