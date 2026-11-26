@@ -171,6 +171,7 @@ export interface NshRuntimeContext {
   webControllerAttached(targetId: number, nativeTag: string): boolean;
   webNavigate(targetId: number, url: string): boolean;
   webDownloadAllowed(targetId: number, url: string): boolean;
+  webMediaAllowed?(targetId: number, kind: string): boolean;
   webEvent(event: WebEventPayload): boolean;
 }
 const inputTypes: Map<string, InputType> = new Map([

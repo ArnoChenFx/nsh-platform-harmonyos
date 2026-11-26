@@ -1161,6 +1161,38 @@ pub(crate) fn download_allowed(target_id: u32, _url: &str) -> napi_ohos::Result<
     })
 }
 
+pub(crate) fn media_allowed(target_id: u32, kind: &str) -> napi_ohos::Result<bool> {
+    NativeAttachment::dispatch(target_id, || {
+        use nsh_core::access::WebMedia;
+        let media = match kind {
+            "microphone" => WebMedia::Microphone,
+            "camera" => WebMedia::Camera,
+            _ => return false,
+        };
+        let Some(route) = ROUTES.with(|routes| routes.borrow().get(&target_id).cloned()) else {
+            return false;
+        };
+        let Some(node) = route.node.upgrade() else {
+            return false;
+        };
+        if node
+            .dispatcher
+            .upgrade()
+            .is_none_or(|d| !d.live.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return false;
+        }
+        let granted = route.access.allows_web_media(media);
+        if !granted {
+            log::warn!(
+                target: "js",
+                "web view {kind} capture is not granted: add it to capabilities.webview.media"
+            );
+        }
+        granted
+    })
+}
+
 fn dispatch_download_lifecycle(event: WebEvent) -> bool {
     let target_id = event.target_id;
     let route_target = ROUTES.with(|routes| {

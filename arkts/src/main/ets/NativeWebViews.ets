@@ -250,6 +250,7 @@ class WebEntry {
   private pendingCommands: WebCommand[] = [];
   private inputCommands: Promise<void> = Promise.resolve();
   private fileSelectors: Set<FileSelectorResult> = new Set();
+  private permissionRequests: Set<PermissionRequest> = new Set();
   private downloads: Map<string, webview.WebDownloadItem> = new Map();
   private downloadGuids: Map<string, string> = new Map();
   private startedDownloads: Set<string> = new Set();
@@ -576,13 +577,30 @@ class WebEntry {
     }
   }
 
+  private denyPermissionRequest(request: PermissionRequest): void {
+    if (!this.permissionRequests.delete(request)) {
+      return;
+    }
+    try {
+      request.deny();
+    } catch {}
+  }
+
+  private grantPermissionRequest(request: PermissionRequest, resources: string[]): void {
+    if (!this.permissionRequests.delete(request)) {
+      return;
+    }
+    try {
+      request.grant(resources);
+    } catch {}
+  }
+
   handlePermissionRequest(request: PermissionRequest): void {
+    this.permissionRequests.add(request);
     const epoch = this.epoch;
     this.resolvePermissionRequest(request, epoch).catch((error: Error) => {
       console.warn(`NSH WebView permission request: ${String(error)}`);
-      try {
-        request.deny();
-      } catch {}
+      this.denyPermissionRequest(request);
     });
   }
 
@@ -591,47 +609,64 @@ class WebEntry {
     epoch: number,
   ): Promise<void> {
     if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
-      request.deny();
+      this.denyPermissionRequest(request);
       return;
     }
     const resources = request.getAccessibleResource();
     const permissions: Permissions[] = [];
     const grantedResources: string[] = [];
     for (const resource of resources) {
+      let kind: string;
+      let permission: Permissions;
       if (resource === ProtectedResourceType.VIDEO_CAPTURE) {
-        permissions.push("ohos.permission.CAMERA");
-        grantedResources.push(resource);
+        kind = "camera";
+        permission = "ohos.permission.CAMERA";
       } else if (resource === ProtectedResourceType.AUDIO_CAPTURE) {
-        permissions.push("ohos.permission.MICROPHONE");
-        grantedResources.push(resource);
+        kind = "microphone";
+        permission = "ohos.permission.MICROPHONE";
+      } else {
+        continue;
       }
+      if (grantedResources.includes(resource)) {
+        continue;
+      }
+      const allowedByCapability = this.context.webMediaAllowed
+        ? this.context.webMediaAllowed(this.settings.targetId, kind)
+        : false;
+      if (!allowedByCapability) {
+        continue;
+      }
+      grantedResources.push(resource);
+      permissions.push(permission);
     }
     if (permissions.length === 0) {
-      request.deny();
+      this.denyPermissionRequest(request);
       return;
     }
-    const host = this.context.getUIContext().getHostContext();
+    const host =
+      this.webUIContext().getHostContext() ??
+      this.context.getUIContext().getHostContext();
     if (!host) {
-      request.deny();
+      this.denyPermissionRequest(request);
       return;
     }
     const result = await abilityAccessCtrl
       .createAtManager()
       .requestPermissionsFromUser(host, permissions);
     if (this.closed || !this.context.isActive() || epoch !== this.epoch) {
-      request.deny();
+      this.denyPermissionRequest(request);
       return;
     }
     const allowed: string[] = [];
     for (let i = 0; i < grantedResources.length; i += 1) {
-      if (result.authResults[i] === 0) {
+      if (i < result.authResults.length && result.authResults[i] === 0) {
         allowed.push(grantedResources[i]);
       }
     }
     if (allowed.length > 0) {
-      request.grant(allowed);
+      this.grantPermissionRequest(request, allowed);
     } else {
-      request.deny();
+      this.denyPermissionRequest(request);
     }
   }
 
@@ -1211,6 +1246,9 @@ class WebEntry {
       } catch {}
     }
     this.fileSelectors.clear();
+    for (const request of Array.from(this.permissionRequests)) {
+      this.denyPermissionRequest(request);
+    }
     if (this.disposed) {
       return;
     }
