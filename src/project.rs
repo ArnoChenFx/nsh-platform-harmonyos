@@ -1443,6 +1443,12 @@ pub(crate) fn write(
     }
     let nsh_dir = out.join("nsh");
     for (path, bytes) in crate::embedded::ARKTS {
+        if contents.runtime_os == RuntimeOs::OpenHarmony
+            && let Some(patched) = openharmony_arkts_source(path, bytes)
+        {
+            write_file(&join_relative(&nsh_dir, path), patched.as_bytes())?;
+            continue;
+        }
         write_file(&join_relative(&nsh_dir, path), bytes)?;
     }
 
@@ -1545,6 +1551,96 @@ fn copy_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Replaces Huawei HMS-only `@hms.*` imports with OpenHarmony-compatible stubs
+/// so projects built with `--runtime-os openharmony` compile against the public
+/// OpenHarmony SDK (which does not ship `@hms.*` kits).
+fn openharmony_arkts_source(path: &str, bytes: &[u8]) -> Option<String> {
+    match path {
+        "src/main/ets/NativeShare.ets" => Some(
+            r#"import { common } from "@kit.AbilityKit";
+import type { SystemRequest, SystemReply } from "./NativeSystem";
+
+export class NativeShare {
+  async show(
+    _context: common.UIAbilityContext,
+    _key: number,
+    _request: SystemRequest,
+    _live: () => boolean,
+  ): Promise<SystemReply> {
+    return { phase: "dismissed", error: "systemShare is not available on OpenHarmony" };
+  }
+  cancel(_key: number): void {}
+  close(): void {}
+}
+"#
+            .to_owned(),
+        ),
+        "src/main/ets/NativeSpeech.ets" => Some(
+            r#"import { common } from "@kit.AbilityKit";
+import type { SystemReply } from "./NativeSystem";
+
+export interface SpeechReply extends SystemReply {
+  phase: string;
+  text?: string;
+  final?: boolean;
+  error?: string;
+}
+
+export class NativeSpeech {
+  constructor(_context: common.UIAbilityContext) {}
+  async start(
+    _key: number,
+    _language: string | undefined,
+    _interim: boolean,
+    reply: (event: SpeechReply) => void,
+    _live?: () => boolean,
+  ): Promise<void> {
+    reply({ phase: "end", error: "not-supported" });
+  }
+  async stop(_key: number, _abort: boolean): Promise<void> {}
+  close(): void {}
+}
+"#
+            .to_owned(),
+        ),
+        "src/main/ets/NativeSystem.ets" => {
+            let text = std::str::from_utf8(bytes).ok()?;
+            let patched = text
+                .replace(
+                    r#"const kit = await import("@hms.filemanagement.fileManagerService");"#,
+                    r#"throw new Error("moving files to trash is not supported on OpenHarmony");"#,
+                )
+                .replace(
+                    "trashedUri = await kit.default.deleteToTrash(uri);",
+                    r#"trashedUri = "";"#,
+                );
+            Some(patched)
+        }
+        "src/main/ets/NativeDesktop.ets" => {
+            let text = std::str::from_utf8(bytes).ok()?;
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if line.contains("@hms.pcService.statusBarManager") {
+                    continue;
+                }
+                if line.contains("private async applySetTray(") {
+                    out.push_str(
+                        "  private async applySetTray(_generation: number, _cmd: WireCommand): Promise<void> {}\n\
+                         \x20 private async applyRemoveTray(): Promise<void> {}\n\
+                         \x20 private removeTraySync(): void {}\n\
+                         \x20 private unsubscribeTray(): void {}\n\
+                         }\n",
+                    );
+                    break;
+                }
+                out.push_str(line);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2745,6 +2841,77 @@ mod tests {
                 .iter()
                 .any(|s| { s["name"] == "nsh_perm_camera" && s["value"] == "Video call camera." })
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openharmony_project_omits_hms_imports() {
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-hm-openharmony-hms-stubs-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let app_root = dir.join("app");
+        let build = dir.join("build");
+        let library = dir.join("libnsh_platform_harmonyos.so");
+        fs::create_dir_all(&app_root).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(&library, b"so").unwrap();
+
+        let config = AppConfig::from_json(
+            &app_root,
+            &json!({ "name": "StubTest", "id": "com.example.stubtest" }),
+        )
+        .unwrap();
+
+        let ohos_out = dir.join("out-ohos");
+        write(
+            &ohos_out,
+            &config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::OpenHarmony,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap();
+        let ohos_ets = join_all(&ohos_out, ["nsh", "src", "main", "ets"]);
+        for entry in fs::read_dir(&ohos_ets).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("ets") {
+                let text = fs::read_to_string(&path).unwrap();
+                assert!(
+                    !text.contains("@hms."),
+                    "{} should not reference @hms.* when targeting OpenHarmony",
+                    path.display()
+                );
+            }
+        }
+
+        let hmos_out = dir.join("out-hmos");
+        write(
+            &hmos_out,
+            &config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::HarmonyOs,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap();
+        let hmos_share = fs::read_to_string(join_all(
+            &hmos_out,
+            ["nsh", "src", "main", "ets", "NativeShare.ets"],
+        ))
+        .unwrap();
+        assert!(hmos_share.contains("@hms.collaboration.systemShare"));
 
         let _ = fs::remove_dir_all(&dir);
     }
