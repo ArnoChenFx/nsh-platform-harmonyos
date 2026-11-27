@@ -38,7 +38,11 @@ pub use extensions::{
     WantObserverGuard, ability, cache_dir, files_dir, launch_want, on_ability_want, prepare_image,
     prepare_image_bytes, run_on_ui_thread,
 };
-pub use interop::NshNativeProperty;
+pub use interop::{
+    GpuSurfaceHost, GpuSurfaceOptions, GpuSurfaceProperty, GpuSurfaceRenderer, NshNativeProperty,
+    has_gpu_surface, register_gpu_surface, register_gpu_surface_with_options,
+    unregister_gpu_surface,
+};
 pub use linked::LinkedApp;
 
 static UI_SETS: std::sync::RwLock<Vec<nsh_core::element::Registry>> =

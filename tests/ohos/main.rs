@@ -134,3 +134,6 @@ mod pan;
 #[path = "../../src/input/wheel.rs"]
 #[allow(dead_code)]
 mod wheel;
+
+#[path = "../../src/render/canvas_cache.rs"]
+mod canvas_cache;
