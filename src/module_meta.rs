@@ -83,6 +83,56 @@ pub(crate) enum OhpmDep {
     LocalPath(PathBuf),
 }
 
+/// External HAR / SDK module specifiers (`"pkg"` for default export or
+/// `"pkg#exportName"` for a named export) that implement NSH platform provider
+/// interfaces (`NshPlatformProviders`, `NshShareProvider`, `NshTrashProvider`,
+/// `NshSpeechProvider`, `NshTrayProvider`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PlatformProviders {
+    /// Unified module specifier exporting `NshPlatformProviders`.
+    pub(crate) all: Option<String>,
+    /// Module specifier for `NshShareProvider`.
+    pub(crate) share: Option<String>,
+    /// Module specifier for `NshTrashProvider`.
+    pub(crate) trash: Option<String>,
+    /// Module specifier for `NshSpeechProvider`.
+    pub(crate) speech: Option<String>,
+    /// Module specifier for `NshTrayProvider`.
+    pub(crate) tray: Option<String>,
+}
+
+impl PlatformProviders {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.all.is_none()
+            && self.share.is_none()
+            && self.trash.is_none()
+            && self.speech.is_none()
+            && self.tray.is_none()
+    }
+
+    pub(crate) fn get(&self, slot: &str) -> Option<&str> {
+        match slot {
+            "all" => self.all.as_deref(),
+            "share" => self.share.as_deref(),
+            "trash" => self.trash.as_deref(),
+            "speech" => self.speech.as_deref(),
+            "tray" => self.tray.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set(&mut self, slot: &str, value: String) {
+        match slot {
+            "all" => self.all = Some(value),
+            "share" => self.share = Some(value),
+            "trash" => self.trash = Some(value),
+            "speech" => self.speech = Some(value),
+            "tray" => self.tray = Some(value),
+            _ => unreachable!("invalid provider slot: {slot}"),
+        }
+    }
+}
+
 /// Merged HarmonyOS packaging declarations (from `nsh.json` and/or crates).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct HarmonyMeta {
@@ -103,6 +153,8 @@ pub(crate) struct HarmonyMeta {
     /// Ability / extensionAbility `.ets` source files to stage into
     /// `entry/src/main/<rel_path>` (keyed by normalized `ets/...` path).
     pub(crate) ability_sources: BTreeMap<String, PathBuf>,
+    /// External HAR / SDK provider modules for share, trash, speech, and tray.
+    pub(crate) providers: PlatformProviders,
 }
 
 impl HarmonyMeta {
@@ -302,6 +354,9 @@ impl ModuleMeta {
                     .any(|a| a.get("name").and_then(Value::as_str) == Some(clash.key.as_str())),
                 "harmonyos.dependencies" => app.dependencies.contains_key(&clash.key),
                 "harmonyos.strings" => app.strings.contains_key(&clash.key),
+                "harmonyos.providers" => {
+                    app.providers.get(&clash.key).is_some() || app.providers.all.is_some()
+                }
                 _ => false,
             };
             if !settled {
@@ -367,6 +422,13 @@ impl ModuleMeta {
                 .entry(dest.clone())
                 .or_insert_with(|| src.clone());
         }
+        for slot in ["all", "share", "trash", "speech", "tray"] {
+            if app.providers.get(slot).is_none()
+                && let Some(spec) = self.meta.providers.get(slot)
+            {
+                app.providers.set(slot, spec.to_owned());
+            }
+        }
         if app.query_schemes.len() > 50 {
             bail!(
                 "harmonyos.querySchemes has {} entries (HarmonyOS allows at most 50)",
@@ -397,6 +459,7 @@ impl ModuleMeta {
                 "extensionAbilities" => self.merge_abilities(owner, dir, at, value, true, is_app)?,
                 "dependencies" => self.merge_dependencies(owner, dir, at, value, is_app)?,
                 "strings" => self.merge_strings(owner, at, value, is_app)?,
+                "provider" | "providers" => self.merge_providers(owner, at, key, value)?,
                 _ => warnings.push(format!(
                     "{owner}: {at} `harmonyos.{key}` is not something this nsh-platform-harmonyos reads: left out"
                 )),
@@ -786,6 +849,147 @@ impl ModuleMeta {
         }
         Ok(())
     }
+
+    fn merge_providers(
+        &mut self,
+        owner: &str,
+        at: &str,
+        field: &str,
+        value: &Value,
+    ) -> anyhow::Result<()> {
+        if let Some(raw) = value.as_str() {
+            let spec = validate_provider_specifier(raw)
+                .with_context(|| format!("{owner}: {at} `harmonyos.{field}`"))?;
+            self.set_provider_slot(owner, "all", spec);
+            return Ok(());
+        }
+        let table = value.as_object().with_context(|| {
+            format!(
+                "{owner}: {at} `harmonyos.{field}` must be a module specifier string or a table of capability -> module specifier"
+            )
+        })?;
+        for (slot, raw) in table {
+            if !matches!(slot.as_str(), "all" | "share" | "trash" | "speech" | "tray") {
+                bail!(
+                    "{owner}: {at} `harmonyos.{field}`: unknown capability `{slot}` (expected `all`, `share`, `trash`, `speech`, or `tray`)"
+                );
+            }
+            let raw_str = raw.as_str().with_context(|| {
+                format!("{owner}: {at} `harmonyos.{field}.{slot}` must be a non-empty module specifier string")
+            })?;
+            let spec = validate_provider_specifier(raw_str)
+                .with_context(|| format!("{owner}: {at} `harmonyos.{field}.{slot}`"))?;
+            self.set_provider_slot(owner, slot, spec);
+        }
+        Ok(())
+    }
+
+    fn set_provider_slot(&mut self, owner: &str, slot: &str, spec: String) {
+        let owner_key = format!("harmonyos.providers.{slot}");
+        match self.meta.providers.get(slot) {
+            None => {
+                self.owners.insert(owner_key, owner.to_owned());
+                self.meta.providers.set(slot, spec);
+            }
+            Some(existing) if existing == spec => {}
+            Some(_) => {
+                let first = self
+                    .owners
+                    .get(&owner_key)
+                    .map_or("another crate", String::as_str)
+                    .to_owned();
+                self.clashes.push(Clash {
+                    kind: "harmonyos.providers",
+                    key: slot.to_owned(),
+                    first,
+                    second: owner.to_owned(),
+                });
+            }
+        }
+    }
+}
+
+pub(crate) fn split_provider_specifier(spec: &str) -> (&str, Option<&str>) {
+    match spec.split_once('#') {
+        Some((module_path, "default")) => (module_path, None),
+        Some((module_path, export_name)) => (module_path, Some(export_name)),
+        None => (spec, None),
+    }
+}
+
+/// Extracts the ohpm package name (`"@scope/pkg"` or `"pkg"`) when `module_path`
+/// refers to an ohpm package rather than a built-in ROM/SDK kit (`"@ohos.*"`,
+/// `"@kit.*"`, `"@hms.*"`, `"@vendor.*"`).
+pub(crate) fn provider_ohpm_package(module_path: &str) -> Option<String> {
+    if let Some(rest) = module_path.strip_prefix('@') {
+        let (scope, after_scope) = rest.split_once('/')?;
+        let pkg = after_scope.split('/').next().unwrap_or(after_scope);
+        Some(format!("@{scope}/{pkg}"))
+    } else {
+        Some(
+            module_path
+                .split('/')
+                .next()
+                .unwrap_or(module_path)
+                .to_owned(),
+        )
+    }
+}
+
+fn is_valid_ident(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '$'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+}
+
+fn validate_provider_specifier(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.contains("..") {
+        bail!("invalid provider module specifier {raw:?}");
+    }
+    let (module_path, export_name) = match trimmed.split_once('#') {
+        Some((m, e)) => {
+            if e.is_empty() || e.contains('#') || !is_valid_ident(e) {
+                bail!(
+                    "invalid provider export name {e:?} in {raw:?} (expected `module#exportName`)"
+                );
+            }
+            (m, (e != "default").then_some(e))
+        }
+        None => (trimmed, None),
+    };
+    if module_path.is_empty()
+        || module_path.len() > 214
+        || module_path.starts_with('/')
+        || module_path.ends_with('/')
+        || module_path.contains("//")
+        || !module_path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '.' | '-' | '_' | ':'))
+    {
+        bail!("invalid provider module specifier {raw:?}");
+    }
+    if let Some(rest) = module_path.strip_prefix('@')
+        && !rest.contains('/')
+        && !rest.contains('.')
+    {
+        bail!(
+            "invalid scoped provider module specifier {raw:?} (expected `@scope/pkg` or `@kit.Name`)"
+        );
+    }
+    let pkg_root = provider_ohpm_package(module_path);
+    if matches!(
+        pkg_root.as_deref().unwrap_or(module_path),
+        "@nsh/harmonyos" | "libnsh_platform_harmonyos.so"
+    ) {
+        bail!("provider module specifier {raw:?} cannot reference NSH itself");
+    }
+    Ok(match export_name {
+        Some(export) => format!("{module_path}#{export}"),
+        None => module_path.to_owned(),
+    })
 }
 
 /// Deterministic `string.json` resource key for a permission's plain-text reason.
@@ -1050,6 +1254,14 @@ fn normalize_ets_entry(src_entry: &str) -> anyhow::Result<String> {
         })
     {
         bail!("must not escape `entry/src/main/ets/`");
+    }
+    if matches!(
+        rel,
+        "ets/entryability/EntryAbility.ets"
+            | "ets/entryabilitystage/EntryAbilityStage.ets"
+            | "ets/pages/Index.ets"
+    ) {
+        bail!("`{rel}` is reserved by NSH");
     }
     Ok(rel.to_owned())
 }
@@ -1473,5 +1685,102 @@ mod tests {
         assert!(app.abilities[0].get("srcFile").is_none());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merges_and_validates_platform_providers() {
+        let a = json!({
+            "nsh": {
+                "harmonyos": {
+                    "providers": {
+                        "share": "@acme/ohos-share",
+                        "trash": "@acme/ohos-trash"
+                    }
+                }
+            }
+        });
+        let b = json!({
+            "nsh": {
+                "harmonyos": {
+                    "providers": {
+                        "share": "@other/ohos-share",
+                        "speech": "@other/ohos-speech"
+                    }
+                }
+            }
+        });
+        let (meta, warnings) = ModuleMeta::from_metadata(&metadata(&[
+            ("crate-a", "/work/a/Cargo.toml", a, &[]),
+            ("crate-b", "/work/b/Cargo.toml", b, &[]),
+        ]))
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let err = meta
+            .apply(&mut HarmonyMeta::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("crate-a and crate-b") && err.contains("harmonyos.providers"),
+            "{err}"
+        );
+
+        let mut app = HarmonyMeta::from_app_json(
+            Path::new("/app"),
+            &json!({
+                "harmonyos": {
+                    "providers": {
+                        "share": "@app/ohos-share",
+                        "tray": "@app/ohos-tray"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        meta.apply(&mut app).unwrap();
+        assert_eq!(app.providers.share.as_deref(), Some("@app/ohos-share"));
+        assert_eq!(app.providers.trash.as_deref(), Some("@acme/ohos-trash"));
+        assert_eq!(app.providers.speech.as_deref(), Some("@other/ohos-speech"));
+        assert_eq!(app.providers.tray.as_deref(), Some("@app/ohos-tray"));
+
+        // Unified `provider` string in nsh.json also settles per-slot clashes,
+        // and `#default` normalizes to default import while named exports stay intact.
+        let mut unified_app = HarmonyMeta::from_app_json(
+            Path::new("/app"),
+            &json!({
+                "harmonyos": {
+                    "provider": "@app/all-providers#default",
+                    "providers": {
+                        "speech": "@app/all-providers#customSpeech"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        meta.apply(&mut unified_app).unwrap();
+        assert_eq!(
+            unified_app.providers.all.as_deref(),
+            Some("@app/all-providers")
+        );
+        assert_eq!(
+            unified_app.providers.speech.as_deref(),
+            Some("@app/all-providers#customSpeech")
+        );
+
+        // Invalid provider keys or specifiers are rejected.
+        for bad in [
+            json!({ "harmonyos": { "providers": { "unknown": "@acme/x" } } }),
+            json!({ "harmonyos": { "provider": "@nsh/harmonyos" } }),
+            json!({ "harmonyos": { "provider": "@nsh/harmonyos#registerPlatformProviders" } }),
+            json!({ "harmonyos": { "provider": "../bad" } }),
+            json!({ "harmonyos": { "provider": "@bare" } }),
+            json!({ "harmonyos": { "provider": "@acme/pkg#bad-ident" } }),
+            json!({ "harmonyos": { "provider": "@acme/pkg#" } }),
+        ] {
+            assert!(
+                HarmonyMeta::from_app_json(Path::new("/app"), &bad).is_err(),
+                "expected error for {bad}"
+            );
+        }
     }
 }

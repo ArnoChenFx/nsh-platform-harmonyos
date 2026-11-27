@@ -33,6 +33,8 @@ import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames"
 
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
+import { initDefaultPlatformProviders } from "./DefaultPlatformProviders";
+import { getPlatformProviders } from "./PlatformProviders";
 import { startAbilityForResult } from "./NativeExtensions";
 import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
@@ -709,11 +711,12 @@ class HostSession {
     this.lastFontSizeScale = config?.fontSizeScale ?? 1.0;
     this.lastLanguage = language;
     this.fontId = config?.fontId ?? "";
+    initDefaultPlatformProviders();
+    const platformProviders = getPlatformProviders();
     this.sessionId = mod.nshCreateSession(
       {
-        shareAvailable:
-          deviceInfo.sdkApiVersion >= 18 && canIUse("SystemCapability.Collaboration.SystemShare"),
-        speechAvailable: canIUse("SystemCapability.AI.SpeechRecognizer"),
+        shareAvailable: platformProviders.share.isAvailable(),
+        speechAvailable: platformProviders.speech.isAvailable(),
         sdkApiVersion: deviceInfo.sdkApiVersion,
         deviceType: deviceInfo.deviceType ?? "phone",
         cacheDir: abilityContext.cacheDir,

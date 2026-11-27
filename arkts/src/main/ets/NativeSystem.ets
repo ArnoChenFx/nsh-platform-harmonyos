@@ -5,6 +5,7 @@ import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAuthSession } from "./NativeAuthSession";
 import { NativeClipboard } from "./NativeClipboard";
 import { NativeNotifications } from "./NativeNotifications";
+import { deleteToTrash } from "./NativeTrash";
 
 // The system bridge uses the same typed completion for every service.
 export interface SystemReply {
@@ -157,23 +158,9 @@ export class NativeSystem {
         });
         reply({} as SystemReply);
       } else if (request.op === "file-move-to-trash") {
-        if (!canIUse("SystemCapability.FileManagement.FileManagerService.Core")) {
-          throw new Error("moving files to trash is not supported on this device");
-        }
         const path = request.uri ?? "";
         const uri = path.includes("://") ? path : fileUri.getUriFromPath(path);
-        const kit = await import("@hms.filemanagement.fileManagerService");
-        let trashedUri = "";
-        try {
-          trashedUri = await kit.default.deleteToTrash(uri);
-        } catch (err) {
-          if (path.startsWith("/data/storage/")) {
-            throw new Error(
-              `moving app sandbox files to trash is not supported on HarmonyOS (${String(err)})`,
-            );
-          }
-          throw new Error(String(err));
-        }
+        const trashedUri = await deleteToTrash(this.context, uri, path);
         let trashedPath = trashedUri ?? "";
         if (trashedPath.startsWith("file://")) {
           try {
