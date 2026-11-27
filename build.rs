@@ -104,6 +104,7 @@ fn main() {
     for (name, dir) in [
         ("TEMPLATE", repo.join("template")),
         ("ARKTS", repo.join("arkts")),
+        ("ARKTS_OPENHARMONY", repo.join("arkts-openharmony")),
     ] {
         println!("cargo:rerun-if-changed={}", dir.display());
         let mut list = Vec::new();

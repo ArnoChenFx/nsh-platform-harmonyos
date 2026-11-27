@@ -276,6 +276,29 @@ Otherwise use the LAN address `nsh dev` prints.
 - **Keyboard and safe area.** `@nsh/harmonyos` observes system bar, cutout and keyboard avoid areas automatically and reports only the portion overlapping each `NshSurface`. `Input` uses the system `TextInput` / `TextArea` and scrolls the focused field clear of the keyboard.
 - **Lifecycle.** Detaching a `ContentSlot` keeps the surface and its running VM alive; re-mounting it reattaches the native tree. Call `surface.stop()` to clear the running app while keeping the surface, or `surface.dispose()` when the page or component permanently disappears.
 
+## OpenHarmony platform providers
+
+When `@nsh/harmonyos` is generated with `--runtime-os harmonyos`, it ships default HMS providers for share (`@hms.collaboration.systemShare`), move-to-trash (`@hms.filemanagement.fileManagerService`), speech recognition (`@hms.ai.speechRecognizer`) and the desktop status-bar tray (`@hms.pcService.statusBarManager`).
+
+When generated with `--runtime-os openharmony`, `@hms.*` imports are omitted so the module compiles against the public OpenHarmony SDK, and those four capabilities default to unsupported at runtime unless the host registers custom providers before creating a surface (for example in `AbilityStage.onCreate()`):
+
+```ts
+import { AbilityStage } from '@kit.AbilityKit';
+import { registerPlatformProviders } from '@nsh/harmonyos';
+import { customShare, customSpeech } from '@acme/ohos-provider';
+
+export default class MyAbilityStage extends AbilityStage {
+  onCreate(): void {
+    registerPlatformProviders({
+      share: customShare,
+      speech: customSpeech,
+    });
+  }
+}
+```
+
+Standalone CLI projects can generate this `AbilityStage` automatically from `nsh.json` or crate metadata via `harmonyos.provider` / `harmonyos.providers` (see README, "OpenHarmony & pluggable platform providers").
+
 ## See also
 
 - [Rust Reference](https://github.com/longbridge/nsh/blob/main/website/docs/rust.md)

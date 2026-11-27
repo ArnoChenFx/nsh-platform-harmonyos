@@ -15,7 +15,10 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    module_meta::{HarmonyMeta, OhpmDep, Permission, UsedScene, permission_reason_key},
+    module_meta::{
+        HarmonyMeta, OhpmDep, Permission, PlatformProviders, UsedScene, permission_reason_key,
+        provider_ohpm_package, split_provider_specifier,
+    },
     paths::{join_all, join_relative},
     sdk::{ApiLevel, Arch},
 };
@@ -1001,6 +1004,9 @@ fn build_abilities(
 
 fn build_module_extras(harmonyos: &HarmonyMeta) -> String {
     let mut out = String::new();
+    if !harmonyos.providers.is_empty() {
+        out.push_str(",\n    \"srcEntry\": \"./ets/entryabilitystage/EntryAbilityStage.ets\"");
+    }
     if !harmonyos.query_schemes.is_empty() {
         let schemes = Value::Array(
             harmonyos
@@ -1177,6 +1183,31 @@ fn validate_ohpm_dependencies(harmonyos: &HarmonyMeta) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ensures ohpm packages referenced in `harmonyos.provider` / `harmonyos.providers`
+/// are declared in `harmonyos.dependencies` (SDK/ROM kits such as `@ohos.*`,
+/// `@kit.*`, `@hms.*`, or `@vendor.*` do not require an `oh-package.json5` entry).
+fn validate_platform_providers(harmonyos: &HarmonyMeta) -> anyhow::Result<()> {
+    for slot in ["all", "share", "trash", "speech", "tray"] {
+        let Some(spec) = harmonyos.providers.get(slot) else {
+            continue;
+        };
+        let (module_path, _) = split_provider_specifier(spec);
+        if let Some(pkg) = provider_ohpm_package(module_path)
+            && !harmonyos.dependencies.contains_key(&pkg)
+        {
+            let key_path = if slot == "all" {
+                "harmonyos.provider".to_owned()
+            } else {
+                format!("harmonyos.providers.{slot}")
+            };
+            bail!(
+                "{key_path}: package `{pkg}` (from `{spec}`) is not declared in `harmonyos.dependencies`"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn ensure_har_module_files(
     dest_root: &Path,
     src_root: &Path,
@@ -1345,6 +1376,7 @@ pub(crate) fn write(
         &config.harmonyos.abilities,
     )?;
     validate_ohpm_dependencies(&config.harmonyos)?;
+    validate_platform_providers(&config.harmonyos)?;
 
     let signing = indent_json(&Value::Array(preserved_signing.signing_configs.clone()), 4);
     let product_signing = match &preserved_signing.product_signing_config {
@@ -1361,6 +1393,7 @@ pub(crate) fn write(
         &["nshm-deps"],
         &["entry", "libs"],
         &["entry", "nshm-deps"],
+        &["entry", "src", "main", "ets", "entryabilitystage"],
         &["entry", "src", "main", "resources", "rawfile"],
         &["AppScope", "resources", "base", "media"],
     ] {
@@ -1375,6 +1408,7 @@ pub(crate) fn write(
     let module_extras = build_module_extras(&config.harmonyos);
     let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
+    let ability_stage_source = render_entry_ability_stage(&config.harmonyos.providers);
     let bundle_resource = if contents.build.join("bundle.nshc").is_file() {
         "bundle.nshc"
     } else {
@@ -1425,6 +1459,20 @@ pub(crate) fn write(
         };
         write_file(&target, &out_bytes)?;
     }
+    if let Some(stage_ets) = ability_stage_source {
+        let stage_path = join_all(
+            out,
+            [
+                "entry",
+                "src",
+                "main",
+                "ets",
+                "entryabilitystage",
+                "EntryAbilityStage.ets",
+            ],
+        );
+        write_file(&stage_path, stage_ets.as_bytes())?;
+    }
     for (dest_rel, src_file) in &config.harmonyos.ability_sources {
         let dest = join_relative(join_all(out, ["entry", "src", "main"]), dest_rel);
         let bytes = fs::read(src_file)
@@ -1444,6 +1492,11 @@ pub(crate) fn write(
     let nsh_dir = out.join("nsh");
     for (path, bytes) in crate::embedded::ARKTS {
         write_file(&join_relative(&nsh_dir, path), bytes)?;
+    }
+    if contents.runtime_os == RuntimeOs::OpenHarmony {
+        for (path, bytes) in crate::embedded::ARKTS_OPENHARMONY {
+            write_file(&join_relative(&nsh_dir, path), bytes)?;
+        }
     }
 
     let libs = join_all(out, ["entry", "libs", contents.arch.abi()]);
@@ -1545,6 +1598,54 @@ fn copy_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn format_provider_import(local_ident: &str, spec: &str) -> String {
+    let (module_path, export_name) = split_provider_specifier(spec);
+    let escaped = json_text(module_path);
+    match export_name {
+        Some(export) => format!("import {{ {export} as {local_ident} }} from \"{escaped}\";\n"),
+        None => format!("import {local_ident} from \"{escaped}\";\n"),
+    }
+}
+
+/// Renders `entry/src/main/ets/entryabilitystage/EntryAbilityStage.ets` when
+/// `harmonyos.provider` or `harmonyos.providers` is configured.
+///
+/// Running registration inside `AbilityStage.onCreate()` guarantees providers
+/// are installed once per module load before `EntryAbility` or any custom
+/// `harmonyos.abilities` / `extensionAbilities` run, while keeping external HAR
+/// imports in `entry` (rather than `nsh`) so provider HARs can depend on
+/// `@nsh/harmonyos` without creating an `ohpm` dependency cycle.
+fn render_entry_ability_stage(providers: &PlatformProviders) -> Option<String> {
+    if providers.is_empty() {
+        return None;
+    }
+    let mut imports = String::from(
+        "import { AbilityStage } from \"@kit.AbilityKit\";\n\
+         import { registerPlatformProviders } from \"@nsh/harmonyos\";\n",
+    );
+    let mut calls = String::new();
+    if let Some(spec) = providers.all.as_deref() {
+        imports.push_str(&format_provider_import("provider_all", spec));
+        calls.push_str("    registerPlatformProviders(provider_all);\n");
+    }
+    let mut slot_fields = String::new();
+    for slot in ["share", "trash", "speech", "tray"] {
+        if let Some(spec) = providers.get(slot) {
+            let local_ident = format!("provider_{slot}");
+            imports.push_str(&format_provider_import(&local_ident, spec));
+            slot_fields.push_str(&format!("      {slot}: {local_ident},\n"));
+        }
+    }
+    if !slot_fields.is_empty() {
+        calls.push_str(&format!(
+            "    registerPlatformProviders({{\n{slot_fields}    }});\n"
+        ));
+    }
+    Some(format!(
+        "{imports}\nexport default class EntryAbilityStage extends AbilityStage {{\n  onCreate(): void {{\n{calls}  }}\n}}\n"
+    ))
 }
 
 #[cfg(test)]
@@ -2745,6 +2846,265 @@ mod tests {
                 .iter()
                 .any(|s| { s["name"] == "nsh_perm_camera" && s["value"] == "Video call camera." })
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generates_hms_default_for_harmonyos_and_external_or_unsupported_providers_for_openharmony() {
+        let arkts_paths: std::collections::HashSet<&str> =
+            crate::embedded::ARKTS.iter().map(|(p, _)| *p).collect();
+        for (path, _) in crate::embedded::ARKTS_OPENHARMONY {
+            assert!(
+                arkts_paths.contains(path),
+                "arkts-openharmony overlay {path} must correspond to a file in arkts/"
+            );
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("nsh-hm-platform-providers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let app_root = dir.join("app");
+        let build = dir.join("build");
+        let library = dir.join("libnsh_platform_harmonyos.so");
+        let har_dir = app_root.join("ohos-provider");
+        fs::create_dir_all(&har_dir).unwrap();
+        fs::write(
+            har_dir.join("oh-package.json5"),
+            r#"{ "name": "@acme/ohos-provider", "version": "1.0.0", "main": "index.ets" }"#,
+        )
+        .unwrap();
+        fs::write(har_dir.join("index.ets"), "export default {};\n").unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(&library, b"so").unwrap();
+
+        let bare_config = AppConfig::from_json(
+            &app_root,
+            &json!({ "name": "ProviderTest", "id": "com.example.providertest" }),
+        )
+        .unwrap();
+
+        // 1. OpenHarmony without external providers: no @hms.* imports anywhere,
+        //    DefaultPlatformProviders leaves Unsupported*Provider active.
+        let ohos_bare = dir.join("out-ohos-bare");
+        write(
+            &ohos_bare,
+            &bare_config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::OpenHarmony,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap();
+        let ohos_ets = join_all(&ohos_bare, ["nsh", "src", "main", "ets"]);
+        for entry in fs::read_dir(&ohos_ets).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "ets" | "ts"))
+            {
+                let text = fs::read_to_string(&path).unwrap();
+                assert!(
+                    !text.contains("@hms."),
+                    "{} should not reference @hms.* when targeting OpenHarmony",
+                    path.display()
+                );
+            }
+        }
+        let ohos_providers_ets =
+            fs::read_to_string(ohos_ets.join("PlatformProviders.ets")).unwrap();
+        assert!(ohos_providers_ets.contains("is not supported on OpenHarmony"));
+        let bare_module: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(
+                &ohos_bare,
+                ["entry", "src", "main", "module.json5"],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(bare_module["module"].get("srcEntry").is_none());
+        assert!(
+            !join_all(
+                &ohos_bare,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "ets",
+                    "entryabilitystage",
+                    "EntryAbilityStage.ets"
+                ]
+            )
+            .exists()
+        );
+
+        // 2. Referencing an ohpm package in `providers` without `harmonyos.dependencies` fails early.
+        let missing_dep_config = AppConfig::from_json(
+            &app_root,
+            &json!({
+                "name": "ProviderTest",
+                "id": "com.example.providertest",
+                "harmonyos": {
+                    "providers": {
+                        "speech": "@acme/missing-speech#speechProvider"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let err = write(
+            &dir.join("out-missing"),
+            &missing_dep_config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::OpenHarmony,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("harmonyos.providers.speech") && err.contains("@acme/missing-speech"),
+            "{err}"
+        );
+
+        // 3. OpenHarmony with external HAR/SDK providers (both default and `#named` exports).
+        let ext_config = AppConfig::from_json(
+            &app_root,
+            &json!({
+                "name": "ProviderTest",
+                "id": "com.example.providertest",
+                "harmonyos": {
+                    "dependencies": {
+                        "@acme/ohos-provider": "file:./ohos-provider"
+                    },
+                    "provider": "@acme/ohos-provider",
+                    "providers": {
+                        "trash": "@acme/ohos-provider#customTrash",
+                        "speech": "@vendor.ai.speech"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let ohos_ext = dir.join("out-ohos-ext");
+        write(
+            &ohos_ext,
+            &ext_config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::OpenHarmony,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap();
+        let ext_module: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(
+                &ohos_ext,
+                ["entry", "src", "main", "module.json5"],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ext_module["module"]["srcEntry"],
+            "./ets/entryabilitystage/EntryAbilityStage.ets"
+        );
+        let stage_path = join_all(
+            &ohos_ext,
+            [
+                "entry",
+                "src",
+                "main",
+                "ets",
+                "entryabilitystage",
+                "EntryAbilityStage.ets",
+            ],
+        );
+        let stage_source = fs::read_to_string(&stage_path).unwrap();
+        assert!(
+            stage_source.contains("import { registerPlatformProviders } from \"@nsh/harmonyos\";")
+        );
+        assert!(stage_source.contains("import provider_all from \"@acme/ohos-provider\";"));
+        assert!(
+            stage_source
+                .contains("import { customTrash as provider_trash } from \"@acme/ohos-provider\";")
+        );
+        assert!(stage_source.contains("import provider_speech from \"@vendor.ai.speech\";"));
+        assert!(stage_source.contains("registerPlatformProviders(provider_all);"));
+        assert!(stage_source.contains("trash: provider_trash,"));
+        assert!(stage_source.contains("speech: provider_speech,"));
+        let entry_pkg: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(&ohos_ext, ["entry", "oh-package.json5"])).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            entry_pkg["dependencies"]["@acme/ohos-provider"]
+                .as_str()
+                .unwrap()
+                .starts_with("file:../nshm-deps/")
+        );
+
+        // Re-packaging without providers cleans up stale `EntryAbilityStage.ets` and `srcEntry`.
+        write(
+            &ohos_ext,
+            &bare_config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::OpenHarmony,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap();
+        assert!(!stage_path.exists());
+        let cleaned_module: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(
+                &ohos_ext,
+                ["entry", "src", "main", "module.json5"],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cleaned_module["module"].get("srcEntry").is_none());
+
+        // 4. HarmonyOS default: DefaultPlatformProviders.ets uses HMS implementations.
+        let hmos_out = dir.join("out-hmos");
+        write(
+            &hmos_out,
+            &bare_config,
+            &Contents {
+                arch: Arch::Arm64,
+                library: &library,
+                build: &build,
+                runtime_os: RuntimeOs::HarmonyOs,
+                min_api: ApiLevel::Api20,
+                compile_api: MIN_API,
+            },
+        )
+        .unwrap();
+        let hmos_default = fs::read_to_string(join_all(
+            &hmos_out,
+            ["nsh", "src", "main", "ets", "DefaultPlatformProviders.ets"],
+        ))
+        .unwrap();
+        assert!(hmos_default.contains("@hms.collaboration.systemShare"));
+        assert!(hmos_default.contains("@hms.filemanagement.fileManagerService"));
+        assert!(hmos_default.contains("@hms.ai.speechRecognizer"));
+        assert!(hmos_default.contains("@hms.pcService.statusBarManager"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -121,9 +121,20 @@ value = "123456"
 [package.metadata.nsh.features.camera.harmonyos.dependencies]
 "@ohos/lottie" = "^2.0.0"
 "@acme/kit" = "file:ohos/kit.har"
+
+[package.metadata.nsh.features.camera.harmonyos.providers]
+speech = "@acme/kit#speechProvider"
 ```
 
-Supported keys: `permissions` (merged into `module.json5` `requestPermissions`, with plain-text `reason` auto-added to `string.json`), `querySchemes`, `metadata`, `abilities` (with optional `srcFile` to stage `.ets` sources and automatic defaults for mandatory HarmonyOS icon/label fields), `extensionAbilities`, `dependencies` (merged into `entry/oh-package.json5` and `entry/build-profile.json5` `arkOptions.runtimeOnly.packages` for dynamic N-API loading, with local `.har`/directory paths staged into root `nshm-deps/` and local directory HARs registered in `build-profile.json5` `modules`), and `strings`. The app's `nsh.json` `"harmonyos"` wins over crate entries and resolves clashes between crates.
+Supported keys: `permissions` (merged into `module.json5` `requestPermissions`, with plain-text `reason` auto-added to `string.json`), `querySchemes`, `metadata`, `abilities` (with optional `srcFile` to stage `.ets` sources and automatic defaults for mandatory HarmonyOS icon/label fields), `extensionAbilities`, `dependencies` (merged into `entry/oh-package.json5` and `entry/build-profile.json5` `arkOptions.runtimeOnly.packages` for dynamic N-API loading, with local `.har`/directory paths staged into root `nshm-deps/` and local directory HARs registered in `build-profile.json5` `modules`), `provider` / `providers`, and `strings`. The app's `nsh.json` `"harmonyos"` wins over crate entries and resolves clashes between crates.
+
+### OpenHarmony & pluggable platform providers
+
+Four system capabilities rely on Huawei's proprietary `@hms.*` kits on HarmonyOS (`systemShare`, `fileManagerService` trash, `speechRecognizer`, and desktop `statusBarManager` tray):
+
+- **`--runtime-os harmonyos` (default)**: Bundles and registers the built-in HMS implementations automatically.
+- **`--runtime-os openharmony`**: Overlays `DefaultPlatformProviders.ets` at build time so zero `@hms.*` kits are imported when compiling against the public OpenHarmony SDK; unconfigured capabilities fail or report unavailable at runtime.
+- **Custom HAR / SDK providers**: Set `harmonyos.provider` (`"<module>"` for a default-exported `NshPlatformProviders`, or `"<module>#<exportName>"` for a named export) or per-capability `harmonyos.providers` (`share`, `trash`, `speech`, `tray`) alongside `harmonyos.dependencies` (not needed for built-in ROM kits such as `@vendor.*`). Packaging generates an `EntryAbilityStage` that registers those providers before any Ability starts; provider HARs can depend on `@nsh/harmonyos` for the `NshPlatformProviders` TypeScript interfaces without circular `ohpm` dependencies.
 
 ## Publishing to HarmonyOS phones
 

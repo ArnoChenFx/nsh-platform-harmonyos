@@ -1,48 +1,26 @@
 import { common } from "@kit.AbilityKit";
-import { util } from "@kit.ArkTS";
 import { ColorMetrics, window } from "@kit.ArkUI";
-import { deviceInfo, emitter } from "@kit.BasicServicesKit";
-import type statusBarManager from "@hms.pcService.statusBarManager";
-import { image } from "@kit.ImageKit";
+import { deviceInfo } from "@kit.BasicServicesKit";
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { UIContext } from "@ohos.arkui.UIContext";
 import display from "@ohos.display";
 import pointer from "@ohos.multimodalInput.pointer";
 import { NativeMenuCleanup } from "./NativeMenus";
 import { syncActiveEditorImeCursor } from "./NativeEditors";
+import { fnv1a64Hex, splitMenuGroups, type WireMenuItem } from "./DesktopMenuUtils";
+import { NativeTray, type NativeTrayHost, type TrayCommand, type WireTrayIcon } from "./NativeTray";
 import {
   NSH_SUBWINDOW_BRIDGE_KEY,
   NSH_SUBWINDOW_ROUTE,
   SubWindowPageBridge,
 } from "./NshSubWindowPage";
 
-export interface WireMenuItem {
-  kind: string;
-  id?: number;
-  label?: string;
-  enabled?: boolean;
-  checked?: boolean;
-  shortcut?: string;
-  role?: string;
-  destructive?: boolean;
-  items?: WireMenuItem[];
-}
-
 interface WireSize {
   width: number;
   height: number;
 }
 
-interface WireTrayIcon {
-  format: string;
-  width?: number;
-  height?: number;
-  whiteBase64?: string;
-  blackBase64?: string;
-  dataBase64?: string;
-}
-
-interface WireCommand {
+interface WireCommand extends TrayCommand {
   op: string;
   windowId?: number;
   kind?: string;
@@ -89,11 +67,6 @@ interface WireCommand {
   icon?: WireTrayIcon;
   id?: number;
   hasOpenSubWindows?: boolean;
-}
-
-interface TrayMenuTarget {
-  id: number;
-  role?: string;
 }
 
 interface WireBoundsPayload {
@@ -169,11 +142,6 @@ interface PopupMenuLease {
   settled: boolean;
 }
 
-// HarmonyOS `statusBarManager` API limits (`@hms.pcService.statusBarManager.d.ts`).
-const STATUS_BAR_MAX_MENU_ITEMS: number = 20;
-const STATUS_BAR_MAX_HOVER_TIPS_CHARS: number = 128;
-// Distinct from menu bar (`0`) and popup menu generations (`1..TRAY_MENU_GENERATION`).
-const TRAY_MENU_GENERATION: number = 0xffffffff;
 const KEYCODE_DPAD_LEFT: number = 2014;
 const KEYCODE_DPAD_RIGHT: number = 2015;
 
@@ -184,26 +152,6 @@ export function isDesktopDevice(deviceType: string | undefined): boolean {
 
 function menuItemKey(item: WireMenuItem, index: number): string {
   return `${index}:${item.kind}:${item.id ?? 0}:${item.label ?? ""}`;
-}
-
-function splitMenuGroups(items: WireMenuItem[]): WireMenuItem[][] {
-  const groups: WireMenuItem[][] = [];
-  let current: WireMenuItem[] = [];
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (item.kind === "separator") {
-      if (current.length > 0) {
-        groups.push(current);
-        current = [];
-      }
-    } else {
-      current.push(item);
-    }
-  }
-  if (current.length > 0) {
-    groups.push(current);
-  }
-  return groups;
 }
 
 @Component
@@ -500,31 +448,8 @@ interface PixelArea {
   height: number;
 }
 
-const FNV_OFFSET_64: bigint = BigInt("0xcbf29ce484222325");
-const FNV_PRIME_64: bigint = BigInt("0x00000100000001b3");
-const MASK_64: bigint = BigInt("0xffffffffffffffff");
-
-// 64-bit FNV-1a hex digest; matches `nsh_core::desktop::DisplayId::from_name` for ASCII names.
-function fnv1a64Hex(input: string): string {
-  let hash: bigint = FNV_OFFSET_64;
-  for (let i = 0; i < input.length; i++) {
-    hash = hash ^ BigInt(input.charCodeAt(i) & 0xff);
-    hash = (hash * FNV_PRIME_64) & MASK_64;
-  }
-  return hash.toString(16).padStart(16, "0");
-}
-
 function displayIdHex(idName: string): string {
   return fnv1a64Hex(idName);
-}
-
-function trayIconDigest(icon?: WireTrayIcon): string {
-  if (!icon) {
-    return "default";
-  }
-  return fnv1a64Hex(
-    `${icon.format}|${icon.width ?? 0}x${icon.height ?? 0}|${icon.whiteBase64 ?? ""}|${icon.blackBase64 ?? ""}|${icon.dataBase64 ?? ""}`,
-  );
 }
 
 async function resolveTargetDisplay(
@@ -2003,49 +1928,7 @@ export class NativeDesktop {
   private switchingMenuBar: boolean = false;
   private readonly attachNativeNodeCb?: (targetId: number, content: FrameNode | null) => boolean;
   private readonly retireNativeNodeCb?: (targetId: number) => boolean;
-  private trayAdded: boolean = false;
-  private traySubscribed: boolean = false;
-  private trayGeneration: number = 0;
-  private trayClickId: number = 0;
-  private trayLastIconKey: string = "";
-  private trayLastHoverTips: string = "";
-  private trayMenuTargets: Map<string, TrayMenuTarget> = new Map();
-  private trayQueue: Promise<void> = Promise.resolve();
-  private trayRemoveSyncFn?: () => void;
-  private trayUnsubscribeFn?: () => void;
-
-  private readonly onTrayIconClick = (_event: emitter.EventData): void => {
-    if (this.closed) {
-      return;
-    }
-    if (this.trayClickId !== 0) {
-      this.emit("tray-click", JSON.stringify({ id: this.trayClickId }));
-    } else if (this.mainParked) {
-      this.emit("reopen", "{}");
-    } else {
-      this.revealMainWindow();
-    }
-  };
-
-  private readonly onTrayRightMenuClick = (event: emitter.EventData): void => {
-    if (this.closed) {
-      return;
-    }
-    const data = event.data as Record<string, Object> | undefined;
-    const rawCode = data?.["menuCode"];
-    const code = typeof rawCode === "string" ? rawCode : "";
-    const target = this.trayMenuTargets.get(code);
-    if (target === undefined) {
-      return;
-    }
-    this.lastTrayMenuClickMs = Date.now();
-    this.noteInternalAbilityTransition(800);
-    this.beginTrayMenuMainHideGuard();
-    this.emit(
-      "menu-select",
-      JSON.stringify({ generation: TRAY_MENU_GENERATION, id: target.id, role: target.role }),
-    );
-  };
+  private readonly tray: NativeTray;
 
   private readonly onWindowRectChange = (_data: window.RectChangeOptions): void => {
     this.syncWindowState();
@@ -2182,6 +2065,35 @@ export class NativeDesktop {
     this.onDisplayMetricsChanged = onDisplayMetricsChanged;
     this.attachNativeNodeCb = attachNativeNode;
     this.retireNativeNodeCb = retireNativeNode;
+    const trayHost: NativeTrayHost = {
+      isClosed: (): boolean => this.closed,
+      isMainParked: (): boolean => this.mainParked,
+      showMainWindow: (): void => {
+        this.revealMainWindow();
+      },
+      onRightMenuWillSelect: (): void => {
+        this.lastTrayMenuClickMs = Date.now();
+        this.noteInternalAbilityTransition(800);
+        this.beginTrayMenuMainHideGuard();
+      },
+      runForTrayRemoval: async (
+        remove: (retryOnBackground: boolean) => Promise<void>,
+      ): Promise<void> => {
+        const needsForegroundBridge =
+          !this.closed &&
+          (this.hiddenByAbility ||
+            ((this.hiddenByApp || this.mainParked) && !this.hasAnyVisibleWindow()));
+        if (needsForegroundBridge) {
+          await this.transitionAbilityToMinimizedMainAsync(async (): Promise<void> => {
+            await remove(true);
+          });
+        } else {
+          await remove(false);
+        }
+      },
+      emit: (kind: string, payload: string): void => this.emit(kind, payload),
+    };
+    this.tray = new NativeTray(abilityContext, trayHost);
     try {
       this.lastDisplayId = mainWindow.getWindowProperties().displayId;
     } catch {}
@@ -2249,16 +2161,16 @@ export class NativeDesktop {
     if (
       !this.closed &&
       this.subWindows.size === 0 &&
-      this.trayAdded &&
+      this.tray.isAdded() &&
       (this.hiddenByApp || this.mainParked) &&
       !this.hiddenByAbility
     ) {
       this.enqueueMain(async (): Promise<void> => {
-        await this.trayQueue.catch((): void => {});
+        await this.tray.settled();
         if (
           this.closed ||
           this.subWindows.size > 0 ||
-          !this.trayAdded ||
+          !this.tray.isAdded() ||
           (!this.hiddenByApp && !this.mainParked) ||
           this.hiddenByAbility
         ) {
@@ -2267,7 +2179,7 @@ export class NativeDesktop {
         try {
           await this.abilityContext.hideAbility();
           this.hiddenByAbility = true;
-          if (!this.trayAdded || this.subWindows.size > 0) {
+          if (!this.tray.isAdded() || this.subWindows.size > 0) {
             await this.transitionAbilityToMinimizedMainAsync();
           }
           if (!this.mainParked) {
@@ -2400,10 +2312,10 @@ export class NativeDesktop {
         this.updateMenuBar(cmd.visible === true, cmd.targetId, cmd.items ?? [], cmd.openIndex);
         break;
       case "setTray":
-        this.enqueueSetTray(cmd);
+        this.tray.enqueueSet(cmd);
         break;
       case "removeTray":
-        this.enqueueRemoveTray();
+        this.tray.enqueueRemove();
         break;
       case "startMoving":
         if (cmd.windowId !== undefined) {
@@ -2435,14 +2347,14 @@ export class NativeDesktop {
       case "quit":
         this.removeMenuBar();
         this.closePopupMenuOnly();
-        this.removeTraySync();
+        this.tray.removeSync();
         this.closeAllSubWindows();
         this.abilityContext.terminateSelf().catch((): void => {});
         break;
       case "restart":
         this.removeMenuBar();
         this.closePopupMenuOnly();
-        this.removeTraySync();
+        this.tray.removeSync();
         this.closeAllSubWindows();
         try {
           const bundleName = this.abilityContext.abilityInfo?.bundleName ?? "";
@@ -2689,7 +2601,7 @@ export class NativeDesktop {
     this.closePopupMenuOnly();
     void this.popupMenus.settled();
     this.closeAllSubWindows();
-    this.removeTraySync();
+    this.tray.removeSync();
     try {
       this.mainWindow.off("windowRectChange", this.onWindowRectChange);
     } catch {}
@@ -2983,7 +2895,7 @@ export class NativeDesktop {
         return;
       }
       try {
-        await this.trayQueue.catch((): void => {});
+        await this.tray.settled();
         if (gen !== this.trayMenuSuppressGen || this.closed || (!this.hiddenByApp && !this.mainParked)) {
           return;
         }
@@ -2997,7 +2909,7 @@ export class NativeDesktop {
           }
           return;
         }
-        if (this.trayAdded) {
+        if (this.tray.isAdded()) {
           let mainShowing = false;
           try {
             mainShowing = this.mainWindow.isWindowShowing();
@@ -3006,7 +2918,7 @@ export class NativeDesktop {
             try {
               await this.abilityContext.hideAbility();
               this.hiddenByAbility = true;
-              if (!this.trayAdded || this.subWindows.size > 0) {
+              if (!this.tray.isAdded() || this.subWindows.size > 0) {
                 await this.transitionAbilityToMinimizedMainAsync();
               }
             } catch {
@@ -3167,7 +3079,7 @@ export class NativeDesktop {
     let showedAbility = false;
     let activationWait: Promise<void> | undefined = undefined;
     await this.enqueueMain(async (): Promise<void> => {
-      await this.trayQueue.catch((): void => {});
+      await this.tray.settled();
       if (this.closed) {
         return;
       }
@@ -3215,7 +3127,7 @@ export class NativeDesktop {
   }
 
   private async hideMainWindowAsync(): Promise<void> {
-    await this.trayQueue.catch((): void => {});
+    await this.tray.settled();
     if (this.closed || this.mainParked) {
       return;
     }
@@ -3223,11 +3135,11 @@ export class NativeDesktop {
     this.hiddenByAbility = false;
     this.closePopupMenuOnly();
     this.closeMenuBarDropdown(false);
-    if (this.subWindows.size === 0 && this.trayAdded) {
+    if (this.subWindows.size === 0 && this.tray.isAdded()) {
       try {
         await this.abilityContext.hideAbility();
         this.hiddenByAbility = true;
-        if (!this.trayAdded || this.subWindows.size > 0) {
+        if (!this.tray.isAdded() || this.subWindows.size > 0) {
           await this.transitionAbilityToMinimizedMainAsync();
         }
         this.visible = false;
@@ -3245,7 +3157,7 @@ export class NativeDesktop {
   }
 
   private async revealMainWindowAsync(): Promise<void> {
-    await this.trayQueue.catch((): void => {});
+    await this.tray.settled();
     if (this.closed || this.mainParked) {
       return;
     }
@@ -3380,7 +3292,7 @@ export class NativeDesktop {
     this.lastWindowStateJson = "";
     this.lastTitleBarJson = "";
     this.enqueueMain(async (): Promise<void> => {
-      await this.trayQueue.catch((): void => {});
+      await this.tray.settled();
       if (!this.mainParked || this.closed) {
         return;
       }
@@ -3397,11 +3309,11 @@ export class NativeDesktop {
         this.backgroundOverridden = false;
         this.applyOpaqueBackground();
       }
-      if (!hasOpenSubWindows && this.subWindows.size === 0 && this.trayAdded) {
+      if (!hasOpenSubWindows && this.subWindows.size === 0 && this.tray.isAdded()) {
         try {
           await this.abilityContext.hideAbility();
           this.hiddenByAbility = true;
-          if (!this.trayAdded || this.subWindows.size > 0) {
+          if (!this.tray.isAdded() || this.subWindows.size > 0) {
             await this.transitionAbilityToMinimizedMainAsync();
           }
           return;
@@ -3426,7 +3338,7 @@ export class NativeDesktop {
       return;
     }
     this.enqueueMain(async (): Promise<void> => {
-      await this.trayQueue.catch((): void => {});
+      await this.tray.settled();
       if (this.mainParked || this.closed) {
         return;
       }
@@ -4015,517 +3927,5 @@ export class NativeDesktop {
         removeAnchor();
       },
     );
-  }
-
-  private enqueueSetTray(cmd: WireCommand): void {
-    const generation = ++this.trayGeneration;
-    this.trayQueue = this.trayQueue
-      .then(async (): Promise<void> => {
-        if (this.closed || generation !== this.trayGeneration) {
-          return;
-        }
-        await this.applySetTray(generation, cmd);
-      })
-      .catch((error: Object): void => {
-        console.warn(`[NSH] setTray failed: ${String(error)}`);
-      });
-  }
-
-  private enqueueRemoveTray(): void {
-    const generation = ++this.trayGeneration;
-    this.trayQueue = this.trayQueue
-      .then(async (): Promise<void> => {
-        if (generation !== this.trayGeneration) {
-          return;
-        }
-        await this.applyRemoveTray();
-      })
-      .catch((): void => {});
-  }
-
-  private async applySetTray(generation: number, cmd: WireCommand): Promise<void> {
-    if (!canIUse("SystemCapability.PCService.StatusBarManager")) {
-      return;
-    }
-    const kit = await import("@hms.pcService.statusBarManager");
-    if (this.closed || generation !== this.trayGeneration) {
-      return;
-    }
-    this.trayRemoveSyncFn = (): void => {
-      try {
-        kit.default.removeFromStatusBar(this.abilityContext);
-      } catch {}
-    };
-    this.trayUnsubscribeFn = (): void => {
-      try {
-        kit.default.off("statusBarIconClick", this.onTrayIconClick);
-      } catch {}
-      try {
-        kit.default.off("rightMenuClick", this.onTrayRightMenuClick);
-      } catch {}
-    };
-    if (deviceInfo.sdkApiVersion >= 26) {
-      try {
-        const supported = await kit.default.isStatusBarCapabilitySupported(this.abilityContext);
-        if (!supported) {
-          return;
-        }
-      } catch {}
-    }
-    if (!this.traySubscribed) {
-      try {
-        kit.default.on("statusBarIconClick", this.onTrayIconClick);
-        kit.default.on("rightMenuClick", this.onTrayRightMenuClick);
-        this.traySubscribed = true;
-      } catch (error) {
-        console.warn(`[NSH] statusBarManager event subscribe failed: ${String(error)}`);
-      }
-    }
-    this.trayClickId = cmd.click ?? 0;
-
-    const nextMenuTargets: Map<string, TrayMenuTarget> = new Map();
-    const menuGroups = this.buildStatusBarMenu(generation, cmd.items ?? [], nextMenuTargets);
-    const rawTips = (cmd.tooltip ?? "").trim() || (cmd.title ?? "").trim();
-    const hoverTips =
-      rawTips.length > STATUS_BAR_MAX_HOVER_TIPS_CHARS
-        ? rawTips.substring(0, STATUS_BAR_MAX_HOVER_TIPS_CHARS)
-        : rawTips;
-    const iconKey = trayIconDigest(cmd.icon);
-
-    if (!this.trayAdded) {
-      const icons = await this.decodeTrayIcons(cmd.icon);
-      if (this.closed || generation !== this.trayGeneration) {
-        icons.white.release().catch((): void => {});
-        icons.black.release().catch((): void => {});
-        return;
-      }
-      const label =
-        hoverTips.length > 0
-          ? hoverTips
-          : this.abilityContext.abilityInfo?.name ?? "App";
-      const item: statusBarManager.StatusBarItem = {
-        icons,
-        quickOperation: {
-          title: label,
-          height: 1,
-          abilityName: "",
-          moduleName: this.abilityContext.abilityInfo?.moduleName ?? "",
-        },
-        statusBarGroupMenu: menuGroups.length > 0 ? menuGroups : undefined,
-      };
-      if (deviceInfo.sdkApiVersion >= 22 && hoverTips.length > 0) {
-        item.hoverTips = hoverTips;
-      }
-      try {
-        await new Promise<void>((resolve, reject) => {
-          try {
-            if (deviceInfo.sdkApiVersion >= 14) {
-              kit.default.addToStatusBar(this.abilityContext, item, (err): void => {
-                if (err) {
-                  reject(err);
-                } else {
-                  resolve();
-                }
-              });
-            } else {
-              kit.default.addToStatusBar(this.abilityContext, item);
-              resolve();
-            }
-          } catch (error) {
-            reject(error);
-          }
-        });
-        if (this.closed || generation !== this.trayGeneration) {
-          try {
-            if (deviceInfo.sdkApiVersion >= 14) {
-              kit.default.removeFromStatusBar(this.abilityContext, (): void => {});
-            } else {
-              kit.default.removeFromStatusBar(this.abilityContext);
-            }
-          } catch {}
-          return;
-        }
-        this.trayAdded = true;
-        this.trayMenuTargets = nextMenuTargets;
-        this.trayLastIconKey = iconKey;
-        this.trayLastHoverTips = hoverTips;
-      } catch (error) {
-        console.warn(`[NSH] addToStatusBar failed: ${String(error)}`);
-      } finally {
-        icons.white.release().catch((): void => {});
-        icons.black.release().catch((): void => {});
-      }
-      return;
-    }
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        try {
-          if (deviceInfo.sdkApiVersion >= 14) {
-            kit.default.updateStatusBarMenu(this.abilityContext, menuGroups, (err): void => {
-              if (err) {
-                reject(err);
-              } else {
-                resolve();
-              }
-            });
-          } else {
-            kit.default.updateStatusBarMenu(this.abilityContext, menuGroups);
-            resolve();
-          }
-        } catch (error) {
-          reject(error);
-        }
-      });
-      if (!this.closed && generation === this.trayGeneration) {
-        this.trayMenuTargets = nextMenuTargets;
-      }
-    } catch (error) {
-      console.warn(`[NSH] updateStatusBarMenu failed: ${String(error)}`);
-    }
-
-    if (iconKey !== this.trayLastIconKey) {
-      const icons = await this.decodeTrayIcons(cmd.icon);
-      if (this.closed || generation !== this.trayGeneration) {
-        icons.white.release().catch((): void => {});
-        icons.black.release().catch((): void => {});
-        return;
-      }
-      try {
-        await new Promise<void>((resolve, reject) => {
-          try {
-            if (deviceInfo.sdkApiVersion >= 14) {
-              kit.default.updateStatusBarIcon(this.abilityContext, icons, (err): void => {
-                if (err) {
-                  reject(err);
-                } else {
-                  resolve();
-                }
-              });
-            } else {
-              kit.default.updateStatusBarIcon(this.abilityContext, icons);
-              resolve();
-            }
-          } catch (error) {
-            reject(error);
-          }
-        });
-        this.trayLastIconKey = iconKey;
-      } catch (error) {
-        console.warn(`[NSH] updateStatusBarIcon failed: ${String(error)}`);
-      } finally {
-        icons.white.release().catch((): void => {});
-        icons.black.release().catch((): void => {});
-      }
-    }
-
-    if (
-      deviceInfo.sdkApiVersion >= 22 &&
-      hoverTips.length > 0 &&
-      hoverTips !== this.trayLastHoverTips
-    ) {
-      try {
-        await kit.default.updateStatusBarHoverTips(this.abilityContext, hoverTips);
-        this.trayLastHoverTips = hoverTips;
-      } catch {}
-    }
-  }
-
-  private async removeFromStatusBarOnceAsync(): Promise<number> {
-    const kit = await import("@hms.pcService.statusBarManager");
-    return await new Promise<number>((resolve) => {
-      try {
-        if (deviceInfo.sdkApiVersion >= 14) {
-          kit.default.removeFromStatusBar(this.abilityContext, (err): void => {
-            if (err) {
-              resolve(err.code ?? -1);
-            } else {
-              resolve(0);
-            }
-          });
-        } else {
-          kit.default.removeFromStatusBar(this.abilityContext);
-          resolve(0);
-        }
-      } catch (error) {
-        console.warn(`[NSH] removeFromStatusBar failed: ${String(error)}`);
-        resolve(-1);
-      }
-    });
-  }
-
-  private async removeFromStatusBarAsync(retryOnBackground: boolean): Promise<void> {
-    try {
-      let code = await this.removeFromStatusBarOnceAsync();
-      if (code === 1010710004 && retryOnBackground && !this.closed) {
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, 100);
-        });
-        code = await this.removeFromStatusBarOnceAsync();
-      }
-      if (code > 0) {
-        console.warn(`[NSH] removeFromStatusBar failed: code=${code}`);
-      }
-    } catch (error) {
-      console.warn(`[NSH] removeFromStatusBar failed: ${String(error)}`);
-    }
-  }
-
-  private async applyRemoveTray(): Promise<void> {
-    this.trayClickId = 0;
-    this.trayMenuTargets.clear();
-    if (!this.trayAdded || !canIUse("SystemCapability.PCService.StatusBarManager")) {
-      this.unsubscribeTray();
-      return;
-    }
-    this.trayAdded = false;
-    this.trayLastIconKey = "";
-    this.trayLastHoverTips = "";
-    const needsForegroundBridge =
-      !this.closed &&
-      (this.hiddenByAbility ||
-        ((this.hiddenByApp || this.mainParked) && !this.hasAnyVisibleWindow()));
-    if (needsForegroundBridge) {
-      await this.transitionAbilityToMinimizedMainAsync(async (): Promise<void> => {
-        await this.removeFromStatusBarAsync(true);
-      });
-    } else {
-      await this.removeFromStatusBarAsync(false);
-    }
-    this.unsubscribeTray();
-  }
-
-  private removeTraySync(): void {
-    this.trayGeneration++;
-    this.trayClickId = 0;
-    this.trayMenuTargets.clear();
-    if (this.trayAdded && canIUse("SystemCapability.PCService.StatusBarManager")) {
-      this.trayAdded = false;
-      this.trayLastIconKey = "";
-      this.trayLastHoverTips = "";
-      this.trayRemoveSyncFn?.();
-    }
-    this.unsubscribeTray();
-  }
-
-  private unsubscribeTray(): void {
-    if (!this.traySubscribed) {
-      return;
-    }
-    this.traySubscribed = false;
-    this.trayUnsubscribeFn?.();
-  }
-
-  private buildStatusBarMenu(
-    generation: number,
-    items: WireMenuItem[],
-    targets: Map<string, TrayMenuTarget>,
-  ): statusBarManager.StatusBarGroupMenu[] {
-    const abilityName = this.abilityContext.abilityInfo?.name ?? "EntryAbility";
-    const moduleName = this.abilityContext.abilityInfo?.moduleName ?? "entry";
-    const supportsItemOptions = deviceInfo.sdkApiVersion >= 24;
-    let seq = 0;
-    let topLevelCount = 0;
-
-    const makeCode = (item: WireMenuItem): string => {
-      const code = `nsh-${generation}-${++seq}`;
-      targets.set(code, { id: item.id ?? 0, role: item.role });
-      return code;
-    };
-
-    const collectSubItems = (
-      children: WireMenuItem[],
-      out: statusBarManager.StatusBarSubMenuItem[],
-    ): void => {
-      for (let i = 0; i < children.length && out.length < STATUS_BAR_MAX_MENU_ITEMS; i++) {
-        const child = children[i];
-        if (child.kind === "separator" || child.enabled === false) {
-          continue;
-        }
-        if (child.kind === "submenu") {
-          collectSubItems(child.items ?? [], out);
-          continue;
-        }
-        const code = makeCode(child);
-        const subTitle =
-          child.checked === true && !supportsItemOptions
-            ? `✓ ${child.label ?? ""}`
-            : child.label ?? "";
-        const subItem: statusBarManager.StatusBarSubMenuItem = {
-          subTitle,
-          menuAction: {
-            abilityName,
-            moduleName,
-            notifyOnly: true,
-            menuCode: code,
-          },
-        };
-        if (supportsItemOptions) {
-          subItem.menuCode = code;
-          if (child.checked !== undefined) {
-            subItem.options = { selected: child.checked === true };
-          }
-        }
-        out.push(subItem);
-      }
-    };
-
-    const wireGroups = splitMenuGroups(items);
-    const result: statusBarManager.StatusBarGroupMenu[] = [];
-    for (let g = 0; g < wireGroups.length && topLevelCount < STATUS_BAR_MAX_MENU_ITEMS; g++) {
-      const group = wireGroups[g];
-      const outGroup: statusBarManager.StatusBarMenuItem[] = [];
-      for (let i = 0; i < group.length && topLevelCount < STATUS_BAR_MAX_MENU_ITEMS; i++) {
-        const item = group[i];
-        if (item.enabled === false) {
-          continue;
-        }
-        if (item.kind === "submenu") {
-          const subMenu: statusBarManager.StatusBarSubMenuItem[] = [];
-          collectSubItems(item.items ?? [], subMenu);
-          if (subMenu.length === 0) {
-            continue;
-          }
-          const menuItem: statusBarManager.StatusBarMenuItem = {
-            title: item.label ?? "",
-            subMenu,
-          };
-          if (supportsItemOptions) {
-            menuItem.menuCode = `nsh-${generation}-${++seq}`;
-          }
-          outGroup.push(menuItem);
-          topLevelCount++;
-        } else {
-          const code = makeCode(item);
-          const title =
-            item.checked === true && !supportsItemOptions
-              ? `✓ ${item.label ?? ""}`
-              : item.label ?? "";
-          const menuItem: statusBarManager.StatusBarMenuItem = {
-            title,
-            menuAction: {
-              abilityName,
-              moduleName,
-              notifyOnly: true,
-              menuCode: code,
-            },
-          };
-          if (supportsItemOptions) {
-            menuItem.menuCode = code;
-            if (item.checked !== undefined) {
-              menuItem.options = { selected: item.checked === true };
-            }
-          }
-          outGroup.push(menuItem);
-          topLevelCount++;
-        }
-      }
-      if (outGroup.length > 0) {
-        result.push(outGroup);
-      }
-    }
-    return result;
-  }
-
-  private async decodeTrayIcons(icon?: WireTrayIcon): Promise<statusBarManager.StatusBarIcon> {
-    const base64 = new util.Base64Helper();
-    if (
-      icon &&
-      icon.format === "rgba" &&
-      icon.width &&
-      icon.height &&
-      icon.whiteBase64 &&
-      icon.blackBase64
-    ) {
-      try {
-        const whiteBytes = base64.decodeSync(icon.whiteBase64);
-        const blackBytes = base64.decodeSync(icon.blackBase64);
-        const whiteBuf = whiteBytes.buffer.slice(
-          whiteBytes.byteOffset,
-          whiteBytes.byteOffset + whiteBytes.byteLength,
-        );
-        const blackBuf = blackBytes.buffer.slice(
-          blackBytes.byteOffset,
-          blackBytes.byteOffset + blackBytes.byteLength,
-        );
-        const opts: image.InitializationOptions = {
-          size: { width: icon.width, height: icon.height },
-          srcPixelFormat: image.PixelMapFormat.RGBA_8888,
-          pixelFormat: image.PixelMapFormat.RGBA_8888,
-          alphaType: image.AlphaType.PREMUL,
-        };
-        const white = await image.createPixelMap(whiteBuf, opts);
-        try {
-          const black = await image.createPixelMap(blackBuf, opts);
-          return { white, black };
-        } catch (error) {
-          white.release().catch((): void => {});
-          throw error instanceof Error ? error : new Error(String(error));
-        }
-      } catch (error) {
-        console.warn(`[NSH] tray RGBA icon decode failed: ${String(error)}`);
-      }
-    } else if (icon && icon.format === "encoded" && icon.dataBase64) {
-      try {
-        const raw = base64.decodeSync(icon.dataBase64);
-        const rawBuf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
-        const source = image.createImageSource(rawBuf);
-        try {
-          const opts: image.DecodingOptions = {
-            desiredSize: { width: 48, height: 48 },
-            desiredPixelFormat: image.PixelMapFormat.RGBA_8888,
-          };
-          const white = await source.createPixelMap(opts);
-          try {
-            const black = await source.createPixelMap(opts);
-            return { white, black };
-          } catch (error) {
-            white.release().catch((): void => {});
-            throw error instanceof Error ? error : new Error(String(error));
-          }
-        } finally {
-          source.release().catch((): void => {});
-        }
-      } catch (error) {
-        console.warn(`[NSH] tray encoded icon decode failed: ${String(error)}`);
-      }
-    }
-    return this.createFallbackTrayIcons();
-  }
-
-  private async createFallbackTrayIcons(): Promise<statusBarManager.StatusBarIcon> {
-    const side = 48;
-    const whitePixels = new Uint8Array(side * side * 4);
-    const blackPixels = new Uint8Array(side * side * 4);
-    const cx = (side - 1) / 2;
-    const cy = (side - 1) / 2;
-    const r = side * 0.34;
-    for (let y = 0; y < side; y++) {
-      for (let x = 0; x < side; x++) {
-        const dist = Math.hypot(x - cx, y - cy);
-        const cov = Math.max(0, Math.min(1, r + 0.75 - dist));
-        const alpha = Math.round(cov * 255);
-        const idx = (y * side + x) * 4;
-        whitePixels[idx] = alpha;
-        whitePixels[idx + 1] = alpha;
-        whitePixels[idx + 2] = alpha;
-        whitePixels[idx + 3] = alpha;
-        blackPixels[idx + 3] = alpha;
-      }
-    }
-    const opts: image.InitializationOptions = {
-      size: { width: side, height: side },
-      srcPixelFormat: image.PixelMapFormat.RGBA_8888,
-      pixelFormat: image.PixelMapFormat.RGBA_8888,
-      alphaType: image.AlphaType.PREMUL,
-    };
-    const white = await image.createPixelMap(whitePixels.buffer, opts);
-    try {
-      const black = await image.createPixelMap(blackPixels.buffer, opts);
-      return { white, black };
-    } catch (error) {
-      white.release().catch((): void => {});
-      throw error instanceof Error ? error : new Error(String(error));
-    }
   }
 }

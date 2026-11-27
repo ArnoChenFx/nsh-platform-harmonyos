@@ -2,7 +2,13 @@ import { SystemReply } from "./NativeSystem";
 import { abilityAccessCtrl, common } from "@kit.AbilityKit";
 import audio from "@ohos.multimedia.audio";
 import i18n from "@ohos.i18n";
-import type speechRecognizer from "@hms.ai.speechRecognizer";
+import {
+  defaultMapSpeechError,
+  getPlatformProviders,
+  NshSpeechEngine,
+  NshSpeechListener,
+  NshSpeechRecognitionResult,
+} from "./PlatformProviders";
 
 export interface SpeechReply extends SystemReply {
   phase: string;
@@ -25,25 +31,19 @@ function extractErrorCode(error: Object | undefined | null): number | undefined 
   return typeof code === "number" && Number.isFinite(code) ? code : undefined;
 }
 
-function mapHmsSpeechError(code?: number): string {
-  switch (code) {
-    case 201:
-    case 202:
-    case 1002200012:
-      return "not-allowed";
-    case 1002200006:
-    case 1002200008:
-      return "unavailable";
-    default:
-      return "failed";
+function mapSpeechError(code?: number): string {
+  const provider = getPlatformProviders().speech;
+  if (provider.mapErrorCode !== undefined) {
+    return provider.mapErrorCode(code);
   }
+  return defaultMapSpeechError(code);
 }
 
 class Recognition {
   readonly key: number;
   readonly reply: (event: SpeechReply) => void;
   readonly scheduleRelease: (work: () => Promise<void>) => void;
-  engine?: speechRecognizer.SpeechRecognitionEngine;
+  engine?: NshSpeechEngine;
   microphone?: audio.AudioCapturer;
   ended: boolean = false;
   stopping: boolean = false;
@@ -64,7 +64,7 @@ class Recognition {
     this.scheduleRelease = scheduleRelease;
   }
 
-  applyResult(result: speechRecognizer.SpeechRecognitionResult): string {
+  applyResult(result: NshSpeechRecognitionResult): string {
     const clause = result.result ?? "";
     if (result.isFinal) {
       this.committed += clause;
@@ -159,7 +159,8 @@ export class NativeSpeech {
       if (!live()) {
         return;
       }
-      if (!canIUse("SystemCapability.AI.SpeechRecognizer")) {
+      const provider = getPlatformProviders().speech;
+      if (!provider.isAvailable()) {
         session.end("unavailable");
         return;
       }
@@ -180,32 +181,20 @@ export class NativeSpeech {
       const requested = language || i18n.System.getSystemLanguage();
       const lower = requested.toLowerCase();
       const locale = ["zh", "zh-hans", "zh-hans-cn", "zh-cn"].includes(lower) ? "zh-CN" : requested;
-      let engine: speechRecognizer.SpeechRecognitionEngine | undefined = undefined;
+      let engine: NshSpeechEngine | undefined = undefined;
       try {
-        const recognizer = await import("@hms.ai.speechRecognizer");
-        if (!live()) {
-          return;
-        }
-        try {
-          engine = await recognizer.default.createEngine({ language: locale, online: 1 });
-        } catch (error) {
-          if (live()) {
-            console.warn(`NSH speech createEngine: ${String(error)}`);
-            session.end(mapHmsSpeechError(extractErrorCode(error as Object)));
-          }
-          return;
-        }
+        engine = await provider.createEngine({ language: locale, online: 1 });
       } catch (error) {
         if (live()) {
-          console.warn(`NSH speech import: ${String(error)}`);
-          session.end("unavailable");
+          console.warn(`NSH speech createEngine: ${String(error)}`);
+          session.end(mapSpeechError(extractErrorCode(error as Object)));
         }
         return;
       }
       if (engine === undefined) {
         return;
       }
-      const activeEngine: speechRecognizer.SpeechRecognitionEngine = engine;
+      const activeEngine: NshSpeechEngine = engine;
       if (!live()) {
         activeEngine.shutdown();
         return;
@@ -222,10 +211,10 @@ export class NativeSpeech {
         session.end("language-not-supported");
         return;
       }
-      activeEngine.setListener({
+      const listener: NshSpeechListener = {
         onStart: (_id: string, _message: string): void => {},
         onEvent: (_id: string, _code: number, _message: string): void => {},
-        onResult: (_id: string, result: speechRecognizer.SpeechRecognitionResult): void => {
+        onResult: (_id: string, result: NshSpeechRecognitionResult): void => {
           if (!live()) {
             return;
           }
@@ -248,10 +237,11 @@ export class NativeSpeech {
         onError: (_id: string, code: number, message: string): void => {
           if (live()) {
             console.warn(`NSH speech ${code}: ${message}`);
-            session.end(mapHmsSpeechError(code));
+            session.end(mapSpeechError(code));
           }
         },
-      });
+      };
+      activeEngine.setListener(listener);
       const microphone = await audio.createAudioCapturer({
         streamInfo: {
           samplingRate: audio.AudioSamplingRate.SAMPLE_RATE_16000,
@@ -307,7 +297,7 @@ export class NativeSpeech {
       if (live()) {
         console.warn(`NSH speech start: ${String(error)}`);
         const code = extractErrorCode(error as Object);
-        session.end(code !== undefined ? mapHmsSpeechError(code) : "failed");
+        session.end(code !== undefined ? mapSpeechError(code) : "failed");
       }
     }
   }

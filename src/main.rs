@@ -594,6 +594,10 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
     );
     let mut links = vec![
         (
+            join_all(project, ["oh_modules", "@nsh", "harmonyos"]),
+            project.join("nsh"),
+        ),
+        (
             join_all(project, ["entry", "oh_modules", "@nsh", "harmonyos"]),
             project.join("nsh"),
         ),
@@ -642,6 +646,10 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
                 for seg in pkg.split('/') {
                     link.push(seg);
                 }
+                links.push((
+                    join_all(&target, ["oh_modules", "@nsh", "harmonyos"]),
+                    project.join("nsh"),
+                ));
                 links.push((link, target));
             } else if target.is_file() {
                 bail!(
